@@ -71,8 +71,12 @@ def extract_corpus_name_from_path(file_path):
             # 如果是最後一個部分（檔案名），去掉副檔名
             if i == len(path_obj.parts) - 1:
                 part = Path(part).stem
-            name_parts.append(part)
-        
+
+            if part == 'Full-Table(8k)':
+                name_parts.append('full_token')
+            else:
+                name_parts.append(part)
+
         return '_'.join(name_parts)
     
     # 如果不在 Corpora 目錄下，使用檔案名（不含副檔名）
