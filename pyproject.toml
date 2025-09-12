@@ -9,4 +9,5 @@ dependencies = [
     "loguru>=0.7.3",
     "numpy>=1.21.0",
     "pymilvus[model]>=2.3.0",
+    "ragatouille>=0.0.9.post2",
 ]
