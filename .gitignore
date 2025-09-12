@@ -1,7 +1,9 @@
 /__pycache__
 /export_milvus.py
 db/*/*.db
-
+db/*/*.db.lock
+experiment/*.json
+CLAUDE.md
 qgpt_T1_MTLV_mimo_ch.db
 qgpt_T1_MTLV_mimo_en.db
 __pycache__/utils.cpython-311.pyc

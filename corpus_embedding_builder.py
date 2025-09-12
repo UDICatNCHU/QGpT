@@ -18,12 +18,21 @@ Repository: https://github.com/UDICatNCHU/QGpT
 """
 
 import argparse
-import hashlib
 import sys
+import warnings
 from pathlib import Path
 from typing import List, Dict
 from loguru import logger
 from pymilvus import MilvusClient
+import os
+from concurrent.futures import ProcessPoolExecutor
+import torch
+import multiprocessing as mp
+
+# Suppress package warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 from embedding_models import BGE_M3_Flag, BGE_M3_Milvus, JinaColBERT_V2
 from utils import (
@@ -67,87 +76,98 @@ def normalize_vector(vec) -> List[float]:
     return vec
 
 
-def build_corpus_embedding(corpus_path: Path, model_name: str, force_rebuild: bool = False) -> None:
+def extract_document_data(item: Dict) -> tuple[str, Dict]:
+    """Extract preprocessed text and metadata from corpus item."""
+    return (
+        preprocess_text(item['Text']),
+        {
+            'id': item['id'],
+            'filename': item.get('FileName', ''),
+            'sheet_name': item.get('SheetName', '')
+        }
+    )
+
+
+def build_corpus_embedding(corpus_path: Path, model_name: str, force_rebuild: bool = False, gpu_id: int = 0) -> bool:
     """Build embedding for corpus file with specified model."""
     if model_name not in AVAILABLE_MODELS:
         available = ", ".join(AVAILABLE_MODELS.keys())
         logger.error(f"Unknown model: {model_name}. Available: {available}")
-        raise ValueError(f"Unknown model: {model_name}")   
+        return False
      
     # Load and validate data
-    logger.info(f"Loading corpus data from: {corpus_path}")
-    data = load_json_dataset(str(corpus_path))
+    try:
+        data = load_json_dataset(str(corpus_path))
+    except Exception as e:
+        logger.error(f"Failed to load {corpus_path}: {e}")
+        return False
     
     if not validate_corpus_structure(data):
         logger.error(f"Invalid corpus structure in file: {corpus_path}")
-        raise ValueError(f"Invalid corpus structure in file: {corpus_path}")
+        return False
+        
+    # Set GPU device for this process
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
     
-    logger.info(f"Loaded {len(data)} documents")
-    
-    # Initialize model
-    logger.info(f"Initializing model: {model_name}")
-    model = AVAILABLE_MODELS[model_name]()
+    # Initialize model with batch size
+    try:
+        model = AVAILABLE_MODELS[model_name](batch_size=64)
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize model {model_name} on GPU {gpu_id}: {e}")
+        return False
     
     # Setup database path
     db_path = create_safe_db_path(model_name, corpus_path)
     collection_name = "corpus"
-    
-    logger.info(f"Database: {db_path}")
-    logger.info(f"Collection: {collection_name}")
-    logger.info(f"Model dimension: {model.dimension}")
-    
+
     # Check if database exists
     if db_path.exists() and not force_rebuild:
         logger.info(f"Database exists: {db_path}, skipping (use --force to rebuild)")
-        return
+        return True
     
-    # Preprocess documents
-    logger.info("Preprocessing documents...")
-    documents = []
-    metadata = []
+    # Extract documents and metadata  
+    try:
+        documents, metadata = zip(*[extract_document_data(item) for item in data])
+        documents, metadata = list(documents), list(metadata)
+    except Exception as e:
+        logger.error(f"Failed to preprocess documents: {e}")
+        return False
     
-    for item in data:
-        clean_text = preprocess_text(item['Text'])
-        documents.append(clean_text)
+    try:
+        result = model.encode(documents)
+        vectors = result['dense_vecs']
+        logger.info(f"Generated {len(vectors)} vectors of dimension {len(vectors[0])}")
         
-        metadata.append({
-            'id': item['id'],
-            'filename': item.get('FileName', ''),
-            'sheet_name': item.get('SheetName', '')
-        })
-    
-    # Generate embeddings
-    logger.info("Generating embeddings...")
-    result = model.encode(documents)
-    vectors = result['dense_vecs']
-    logger.info(f"Generated {len(vectors)} vectors of dimension {len(vectors[0])}")
+    except Exception as e:
+        logger.error(f"Failed to generate embeddings: {e}")
+        return False
     
     # Setup and populate database
-    _setup_milvus_database(db_path, collection_name, model.dimension, documents, vectors, metadata)
+    try:
+        _setup_milvus_database(db_path, collection_name, model.dimension, documents, vectors, metadata)
+    except Exception as e:
+        logger.error(f"Failed to setup database: {e}")
+        return False
     
-    logger.success(f"Successfully built embeddings for '{corpus_path.name}' using {model.name}")
-    logger.info(f"Database file: {db_path}")
-    logger.info(f"Records: {len(documents)}")
+    logger.success(f"Successfully built embeddings for '{corpus_path.name}' at {db_path} using {model.name}")
+    return True
 
 
 def _setup_milvus_database(db_path: Path, collection_name: str, dimension: int, 
                           documents: List[str], vectors: List, metadata: List[Dict]) -> None:
     """Setup Milvus database and insert data"""
-    logger.info("Setting up vector database...")
     client = MilvusClient(str(db_path))
     
     # Drop existing collection if exists
     if client.has_collection(collection_name):
         client.drop_collection(collection_name)
-        logger.info("Dropped existing collection")
     
     # Create new collection
     actual_dimension = dimension if dimension > 0 else len(vectors[0])
     client.create_collection(collection_name, dimension=actual_dimension)
-    logger.info(f"Created collection with dimension {actual_dimension}")
     
     # Prepare and insert data
-    logger.info("Preparing insert data...")
     insert_data = []
     for i, (doc, vec, meta) in enumerate(zip(documents, vectors, metadata)):
         insert_data.append({
@@ -159,23 +179,7 @@ def _setup_milvus_database(db_path: Path, collection_name: str, dimension: int,
             "sheet_name": meta['sheet_name']
         })
     
-    logger.info("Inserting data into database...")
     client.insert(collection_name, insert_data)
-
-
-def build_corpus_embedding_safe(corpus_path: Path, model_name: str, force: bool) -> bool:
-    """Safe wrapper that returns success/failure without throwing"""
-    try:
-        build_corpus_embedding(corpus_path, model_name, force)
-        return True
-    
-    except (ValueError, FileNotFoundError) as e:
-        logger.error(f"Configuration error for {corpus_path}: {e}")
-        return False
-    
-    except Exception as e:
-        logger.error(f"Unexpected error processing {corpus_path}: {e}")
-        return False
 
 
 def find_corpus_files_in_folder(folder_path: Path) -> List[Path]:
@@ -191,47 +195,46 @@ def find_corpus_files_in_folder(folder_path: Path) -> List[Path]:
     return sorted(corpus_files)
 
 
-def handle_list_commands(args) -> bool:
-    """Handle --list and --list-models flags"""
-    if args.list:
-        corpus_files = get_corpus_files()
-        if corpus_files:
-            logger.info("Available corpora:")
-            for corpus in corpus_files:
-                logger.info(f"  - {corpus['name']}: {corpus['path']}")
-        else:
-            logger.warning("No corpus files found")
-        return True
-    
-    if args.list_models:
-        logger.info("Available models:")
-        for model_name in AVAILABLE_MODELS.keys():
-            logger.info(f"  - {model_name}")
-        return True
-    
-    return False
+def _build_single_corpus_worker(args_tuple) -> bool:
+    """Worker function for parallel processing"""
+    corpus_info, model_name, force_rebuild, gpu_id = args_tuple
+    return build_corpus_embedding(Path(corpus_info['path']), model_name, force_rebuild, gpu_id)
 
 
-def handle_build_all(args) -> None:
-    """Handle --all flag"""
+def build_all_corpora(args) -> None:
+    """Build embeddings for all available corpora using parallel processing"""
     corpus_files = get_corpus_files()
     if not corpus_files:
         logger.warning("No corpus files found")
         return
     
-    logger.info(f"Building embeddings for {len(corpus_files)} corpora using {args.model}")
+    # Determine number of GPUs and workers
+    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    max_workers = min(gpu_count, len(corpus_files))
+        
+    # Prepare work arguments with GPU assignment
+    work_args = []
+    for i, corpus_info in enumerate(corpus_files):
+        gpu_id = i % gpu_count if torch.cuda.is_available() else 0
+        work_args.append((corpus_info, args.model, args.force, gpu_id))
     
+    # Execute in parallel with spawn method for CUDA compatibility
     success_count = 0
-    for i, corpus_info in enumerate(corpus_files, 1):
-        logger.info(f"Processing corpus {i}/{len(corpus_files)}: {corpus_info['name']}")
-        if build_corpus_embedding_safe(Path(corpus_info['path']), args.model, args.force):
-            success_count += 1
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context('spawn')) as executor:
+        results = list(executor.map(_build_single_corpus_worker, work_args))
+        success_count = sum(results)
     
     logger.success(f"Completed: {success_count}/{len(corpus_files)} successful")
 
 
-def handle_build_folder(args) -> None:
-    """Handle --folder flag"""
+def _build_folder_corpus_worker(args_tuple) -> bool:
+    """Worker function for folder parallel processing"""
+    corpus_file, model_name, force_rebuild, gpu_id = args_tuple
+    return build_corpus_embedding(corpus_file, model_name, force_rebuild, gpu_id)
+
+
+def build_folder_corpora(args) -> None:
+    """Build embeddings for all corpus files in folder using parallel processing"""
     folder_path = Path(args.folder)
     
     try:
@@ -244,22 +247,27 @@ def handle_build_folder(args) -> None:
         logger.warning(f"No corpus files found in {folder_path}")
         return
     
-    logger.info(f"Found {len(corpus_files)} corpus files in {folder_path}")
-    logger.info(f"Building embeddings using model: {args.model}")
+    # Determine number of GPUs and workers
+    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    max_workers = min(gpu_count, len(corpus_files))
     
+    # Prepare work arguments with GPU assignment
+    work_args = []
+    for i, corpus_file in enumerate(corpus_files):
+        gpu_id = i % gpu_count if torch.cuda.is_available() else 0
+        work_args.append((corpus_file, args.model, args.force, gpu_id))
+    
+    # Execute in parallel with spawn method for CUDA compatibility
     success_count = 0
-    for i, corpus_file in enumerate(corpus_files, 1):
-        relative_path = corpus_file.relative_to(folder_path)
-        logger.info(f"Processing {i}/{len(corpus_files)}: {relative_path}")
-        
-        if build_corpus_embedding_safe(corpus_file, args.model, args.force):
-            success_count += 1
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context('spawn')) as executor:
+        results = list(executor.map(_build_folder_corpus_worker, work_args))
+        success_count = sum(results)
     
     logger.success(f"Completed folder processing: {success_count}/{len(corpus_files)} successful")
 
 
-def handle_single_corpus(args) -> None:
-    """Handle single corpus processing"""
+def build_single_corpus(args) -> None:
+    """Build embedding for single corpus file"""
     corpus_path = Path(args.corpus_path)
     
     if not corpus_path.exists():
@@ -270,7 +278,7 @@ def handle_single_corpus(args) -> None:
         logger.error(f"Unsupported file type: {corpus_path.suffix}. Supported: {', '.join(SUPPORTED_EXTENSIONS)}")
         sys.exit(1)
     
-    if not build_corpus_embedding_safe(corpus_path, args.model, args.force):
+    if not build_corpus_embedding(corpus_path, args.model, args.force):
         sys.exit(1)
 
 
@@ -312,24 +320,35 @@ Examples:
     return parser.parse_args()
 
 
-def main() -> None:
-    """Main entry point with clear command routing"""
-    args = parse_arguments()
-    
-    # Handle list commands first
-    if handle_list_commands(args):
-        return
-    
-    # Route to appropriate handler
+def determine_action(args) -> str:
+    """Determine which action to take based on arguments"""
+    if args.list:
+        return 'list_corpora'
+    if args.list_models:
+        return 'list_models'
     if args.all:
-        handle_build_all(args)
-    elif args.folder:
-        handle_build_folder(args)
-    elif args.corpus_path:
-        handle_single_corpus(args)
-    else:
-        # No action specified - show help
-        parse_arguments().print_help()
+        return 'build_all'
+    if args.folder:
+        return 'build_folder'
+    if args.corpus_path:
+        return 'build_single'
+    return 'show_help'
+
+
+# Command routing table
+COMMAND_HANDLERS = {
+    'build_all': build_all_corpora,
+    'build_folder': build_folder_corpora,
+    'build_single': build_single_corpus,
+    'show_help': lambda _: parse_arguments().print_help()
+}
+
+
+def main() -> None:
+    """Main entry point with table-driven command routing"""
+    args = parse_arguments()
+    action = determine_action(args)
+    COMMAND_HANDLERS[action](args)
 
 
 if __name__ == "__main__":
