@@ -45,7 +45,6 @@ from utils import (
 )
 
 # Constants - eliminate magic numbers
-MAX_TEXT_LENGTH = 1000  # Milvus storage optimization
 MAX_DB_NAME_LENGTH = 32  # milvus_lite limitation
 SUPPORTED_EXTENSIONS = {'.json'}  # Supported file types
 DEFAULT_BATCH_SIZE = 64  # Model batch size
@@ -174,7 +173,7 @@ def _setup_milvus_database(db_path: Path, collection_name: str, dimension: int,
         insert_data.append({
             "id": i,
             "vector": normalize_vector(vec),
-            "text": doc[:MAX_TEXT_LENGTH],
+            "text": doc,
             "original_id": meta['id'],
             "filename": meta['filename'],
             "sheet_name": meta['sheet_name']

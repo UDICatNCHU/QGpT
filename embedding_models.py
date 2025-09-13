@@ -49,7 +49,7 @@ class BGE_M3_Flag(EmbeddingModel):
         from FlagEmbedding import BGEM3FlagModel
         import torch
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._model = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True, device=device)
+        self._model = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True, device=device, max_length=8192)
         self._dimension = 1024
         self._name = "bge_m3_flag"
         self._batch_size = batch_size
@@ -67,7 +67,7 @@ class BGE_M3_Milvus(EmbeddingModel):
         from pymilvus.model.hybrid import BGEM3EmbeddingFunction
         import torch
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._model = BGEM3EmbeddingFunction(use_fp16=True, device=device, batch_size=batch_size)
+        self._model = BGEM3EmbeddingFunction(use_fp16=True, device=device, batch_size=batch_size, max_length=8192)
         self._dimension = 1024
         self._name = "bge_m3_milvus"
         self._batch_size = batch_size
