@@ -66,7 +66,7 @@ def extract_corpus_name_from_path(file_path):
     corpora_index = path_obj.parts.index('Corpora')
     name_parts = list(path_obj.parts[corpora_index + 1:-1])  # 排除檔名
     name_parts.append(path_obj.stem)  # 加入檔名（無副檔名）
-    
+    print(name_parts)
     return '_'.join(_normalize_name(part) for part in name_parts)
 
 
@@ -91,11 +91,11 @@ def generate_db_name(corpus_name):
     
     # 縮短名稱以符合 Milvus 36 字符限制
     # 移除常見的重複詞彙並使用簡寫
-    clean_name = clean_name.replace('Table', 'T')
     clean_name = clean_name.replace('mimo_table_length_variation', 'MTLV')
     clean_name = clean_name.replace('Single_Table_Retrieval', 'STR')
     clean_name = clean_name.replace('Multi_Table_Retrieval', 'MTR')
     clean_name = clean_name.replace('table_representation', 'TR')
+    clean_name = clean_name.replace('Table', 'T')
     
     db_name = f"qgpt_{clean_name}.db"
     
