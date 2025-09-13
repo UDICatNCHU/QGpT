@@ -48,6 +48,7 @@ from utils import (
 MAX_TEXT_LENGTH = 1000  # Milvus storage optimization
 MAX_DB_NAME_LENGTH = 32  # milvus_lite limitation
 SUPPORTED_EXTENSIONS = {'.json'}  # Supported file types
+DEFAULT_BATCH_SIZE = 64  # Model batch size
 
 # Available models configuration
 AVAILABLE_MODELS = {
@@ -88,7 +89,7 @@ def extract_document_data(item: Dict) -> tuple[str, Dict]:
     )
 
 
-def build_corpus_embedding(corpus_path: Path, model_name: str, force_rebuild: bool = False, gpu_id: int = 0) -> bool:
+def build_corpus_embedding(corpus_path: Path, model_name: str, force_rebuild: bool = False, gpu_id: int = 0, batch_size: int = DEFAULT_BATCH_SIZE) -> bool:
     """Build embedding for corpus file with specified model."""
     if model_name not in AVAILABLE_MODELS:
         available = ", ".join(AVAILABLE_MODELS.keys())
@@ -111,7 +112,7 @@ def build_corpus_embedding(corpus_path: Path, model_name: str, force_rebuild: bo
     
     # Initialize model with batch size
     try:
-        model = AVAILABLE_MODELS[model_name](batch_size=64)
+        model = AVAILABLE_MODELS[model_name](batch_size=batch_size)
         
     except Exception as e:
         logger.error(f"Failed to initialize model {model_name} on GPU {gpu_id}: {e}")
@@ -195,46 +196,46 @@ def find_corpus_files_in_folder(folder_path: Path) -> List[Path]:
     return sorted(corpus_files)
 
 
-def _build_single_corpus_worker(args_tuple) -> bool:
+def _process_corpus_batch(corpus_items, model_name: str, force_rebuild: bool) -> int:
+    """Process corpus files in parallel"""
+    if not corpus_items:
+        return 0
+    
+    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    max_workers = min(gpu_count, len(corpus_items))
+    
+    work_args = [
+        (item, model_name, force_rebuild, i % gpu_count if torch.cuda.is_available() else 0)
+        for i, item in enumerate(corpus_items)
+    ]
+    
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context('spawn')) as executor:
+        results = list(executor.map(_corpus_worker, work_args))
+    
+    return sum(results)
+
+
+def _corpus_worker(args_tuple) -> bool:
     """Worker function for parallel processing"""
-    corpus_info, model_name, force_rebuild, gpu_id = args_tuple
-    return build_corpus_embedding(Path(corpus_info['path']), model_name, force_rebuild, gpu_id)
+    item, model_name, force_rebuild, gpu_id = args_tuple
+    corpus_path = Path(item['path']) if isinstance(item, dict) else item
+    return build_corpus_embedding(corpus_path, model_name, force_rebuild, gpu_id)
 
 
 def build_all_corpora(args) -> None:
-    """Build embeddings for all available corpora using parallel processing"""
+    """Build embeddings for all available corpora"""
     corpus_files = get_corpus_files()
     if not corpus_files:
         logger.warning("No corpus files found")
         return
     
-    # Determine number of GPUs and workers
-    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
-    max_workers = min(gpu_count, len(corpus_files))
-        
-    # Prepare work arguments with GPU assignment
-    work_args = []
-    for i, corpus_info in enumerate(corpus_files):
-        gpu_id = i % gpu_count if torch.cuda.is_available() else 0
-        work_args.append((corpus_info, args.model, args.force, gpu_id))
-    
-    # Execute in parallel with spawn method for CUDA compatibility
-    success_count = 0
-    with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context('spawn')) as executor:
-        results = list(executor.map(_build_single_corpus_worker, work_args))
-        success_count = sum(results)
-    
+    logger.info(f"Building embeddings for {len(corpus_files)} corpora using {args.model}")
+    success_count = _process_corpus_batch(corpus_files, args.model, args.force)
     logger.success(f"Completed: {success_count}/{len(corpus_files)} successful")
 
 
-def _build_folder_corpus_worker(args_tuple) -> bool:
-    """Worker function for folder parallel processing"""
-    corpus_file, model_name, force_rebuild, gpu_id = args_tuple
-    return build_corpus_embedding(corpus_file, model_name, force_rebuild, gpu_id)
-
-
 def build_folder_corpora(args) -> None:
-    """Build embeddings for all corpus files in folder using parallel processing"""
+    """Build embeddings for all corpus files in folder"""
     folder_path = Path(args.folder)
     
     try:
@@ -247,22 +248,8 @@ def build_folder_corpora(args) -> None:
         logger.warning(f"No corpus files found in {folder_path}")
         return
     
-    # Determine number of GPUs and workers
-    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
-    max_workers = min(gpu_count, len(corpus_files))
-    
-    # Prepare work arguments with GPU assignment
-    work_args = []
-    for i, corpus_file in enumerate(corpus_files):
-        gpu_id = i % gpu_count if torch.cuda.is_available() else 0
-        work_args.append((corpus_file, args.model, args.force, gpu_id))
-    
-    # Execute in parallel with spawn method for CUDA compatibility
-    success_count = 0
-    with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context('spawn')) as executor:
-        results = list(executor.map(_build_folder_corpus_worker, work_args))
-        success_count = sum(results)
-    
+    logger.info(f"Found {len(corpus_files)} corpus files in {folder_path}")
+    success_count = _process_corpus_batch(corpus_files, args.model, args.force)
     logger.success(f"Completed folder processing: {success_count}/{len(corpus_files)} successful")
 
 
@@ -320,35 +307,24 @@ Examples:
     return parser.parse_args()
 
 
-def determine_action(args) -> str:
-    """Determine which action to take based on arguments"""
-    if args.list:
-        return 'list_corpora'
-    if args.list_models:
-        return 'list_models'
-    if args.all:
-        return 'build_all'
-    if args.folder:
-        return 'build_folder'
-    if args.corpus_path:
-        return 'build_single'
-    return 'show_help'
-
-
-# Command routing table
-COMMAND_HANDLERS = {
-    'build_all': build_all_corpora,
-    'build_folder': build_folder_corpora,
-    'build_single': build_single_corpus,
-    'show_help': lambda _: parse_arguments().print_help()
-}
-
-
 def main() -> None:
-    """Main entry point with table-driven command routing"""
+    """Main entry point"""
     args = parse_arguments()
-    action = determine_action(args)
-    COMMAND_HANDLERS[action](args)
+    
+    if args.list:
+        # Handle list corpora
+        return
+    if args.list_models:
+        # Handle list models  
+        return
+    if args.all:
+        build_all_corpora(args)
+    elif args.folder:
+        build_folder_corpora(args)
+    elif args.corpus_path:
+        build_single_corpus(args)
+    else:
+        parse_arguments().print_help()
 
 
 if __name__ == "__main__":
