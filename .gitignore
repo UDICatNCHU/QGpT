@@ -2,6 +2,7 @@
 /export_milvus.py
 db/*/*.db
 db/*/*.db.lock
+*.db
 experiment/*/*.json
 CLAUDE.md
 qgpt_T1_MTLV_mimo_ch.db

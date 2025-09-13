@@ -10,6 +10,8 @@ Usage:
     python corpus_embedding_builder.py [corpus_file_path]
     python corpus_embedding_builder.py --list  # 列出所有可用語料庫
     python corpus_embedding_builder.py --all   # 建立所有語料庫的 embedding
+    python corpus_embedding_builder.py --scan-dir ./data  # 遞歸掃描目錄建立 embedding
+    python corpus_embedding_builder.py --scan-dir ./Corpora/Table1_mimo_table_length_variation  # 遞歸掃描目建錄立 embedding
 
 Author: QGpT Research Team
 Repository: https://github.com/UDICatNCHU/QGpT
@@ -31,12 +33,12 @@ from utils import (
     get_corpus_files,
     validate_corpus_structure
 )
-
+from embedding_models import EmbeddingModel, MODELS
 
 class CorpusEmbeddingBuilder:
     """語料庫嵌入向量建立器"""
     
-    def __init__(self, embedding_dim=1024):
+    def __init__(self, model="bge_m3_flag", embedding_dim=1024):
         """
         初始化建立器
         
@@ -44,10 +46,41 @@ class CorpusEmbeddingBuilder:
             embedding_dim: 嵌入向量維度 (BGE-M3 輸出 1024 維)
         """
         self.embedding_dim = embedding_dim
-        print("🔄 初始化 BGE-M3 模型...")
-        self.embedding_fn = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True, device=device, max_length=8192)
+        if model == "jina_colbert_v2" and embedding_dim != 128:
+            print("⚠️  Jina ColBERT v2 嵌入向量維度固定為 128，將忽略 --dim 參數")
+            self.embedding_dim = 128
 
-        print("✅ BGE-M3 模型載入完成")
+        print(f"🔄 初始化 {model} ...")
+        self.model_name = model
+        self.embedding_fn = MODELS.get(model)()
+        print(f"✅ {model} 載入完成")
+    
+    def scan_directory(self, directory_path: str, pattern: str = "*.json") -> List[str]:
+        """
+        遞歸掃描目錄，找出所有符合條件的檔案
+        
+        Args:
+            directory_path: 目錄路徑
+            pattern: 檔案名稱模式（預設: *.json）
+            
+        Returns:
+            符合條件的檔案路徑列表
+        """
+        directory = Path(directory_path)
+        if not directory.exists():
+            raise FileNotFoundError(f"目錄不存在: {directory_path}")
+        
+        if not directory.is_dir():
+            raise NotADirectoryError(f"路徑不是目錄: {directory_path}")
+        
+        # 遞歸搜尋所有符合模式的檔案
+        files = list(directory.rglob(pattern))
+        json_files = [str(f) for f in files if f.is_file()]
+        
+        print(f"🔍 掃描目錄: {directory_path}")
+        print(f"   找到 {len(json_files)} 個 {pattern} 檔案")
+        
+        return json_files
         
     def build_embeddings(self, corpus_path, force_rebuild=False):
         """
@@ -63,7 +96,7 @@ class CorpusEmbeddingBuilder:
         try:
             # 提取語料庫名稱和生成資料庫名稱
             corpus_name = extract_corpus_name_from_path(corpus_path)
-            db_name = generate_db_name(corpus_name)
+            db_name = f"{generate_db_name(corpus_name)}"
             collection_name = generate_collection_name(corpus_name)
             
             print(f"🔄 處理語料庫: {corpus_name}")
@@ -131,7 +164,7 @@ class CorpusEmbeddingBuilder:
                 insert_data.append({
                     "id": i,
                     "vector": vec.astype('float32').tolist(),  # 轉換為 float32 並轉為 list
-                    "text": doc,  # 限制文字長度以節省空間
+                    "text": doc,
                     "original_id": meta['id'],
                     "filename": meta['filename'],
                     "sheet_name": meta['sheet_name']
@@ -149,7 +182,78 @@ class CorpusEmbeddingBuilder:
             
         except Exception as e:
             print(f"❌ 建立嵌入向量失敗: {e}")
+            # 清理損壞的資料庫檔案
+            try:
+                db_path = Path(generate_db_name(extract_corpus_name_from_path(corpus_path)))
+                if db_path.exists():
+                    db_path.unlink()
+                    print(f"🗑️  已清理損壞的資料庫檔案: {db_path}")
+            except Exception as cleanup_error:
+                print(f"⚠️  無法清理檔案: {cleanup_error}")
             return False
+    
+    def build_directory_embeddings(self, directory_path: str, force_rebuild: bool = False) -> Dict[str, bool]:
+        """
+        遞歸掃描目錄並為所有 JSON 檔案建立嵌入向量
+        
+        Args:
+            directory_path: 目錄路徑
+            force_rebuild: 是否強制重建
+            
+        Returns:
+            建立結果字典 {file_path: success}
+        """
+        try:
+            # 掃描目錄找出所有 JSON 檔案
+            json_files = self.scan_directory(directory_path, "*.json")
+            
+            if not json_files:
+                print("⚠️  在指定目錄中沒有找到任何 JSON 檔案")
+                return {}
+            
+            results = {}
+            successful = 0
+            
+            print(f"\n🚀 開始處理 {len(json_files)} 個檔案")
+            
+            for i, file_path in enumerate(json_files, 1):
+                print(f"\n{'='*60}")
+                print(f"處理檔案 {i}/{len(json_files)}: {Path(file_path).name}")
+                
+                try:
+                    success = self.build_embeddings(file_path, force_rebuild)
+                    results[file_path] = success
+                    if success:
+                        successful += 1
+                    
+                except KeyboardInterrupt:
+                    print("\n⚠️  使用者中斷操作")
+                    break
+                except Exception as e:
+                    print(f"❌ 處理檔案失敗: {e}")
+                    results[file_path] = False
+            
+            # 顯示總結
+            print(f"\n{'='*60}")
+            print("目錄掃描建立完成總結:")
+            print(f"目錄: {directory_path}")
+            print(f"總檔案數: {len(json_files)}")
+            print(f"成功: {successful}/{len(results)}")
+            print(f"失敗: {len(results) - successful}/{len(results)}")
+            
+            # 詳細結果
+            if results:
+                print("\n詳細結果:")
+                for file_path, success in results.items():
+                    status = "✅" if success else "❌"
+                    relative_path = Path(file_path).relative_to(directory_path)
+                    print(f"  {status} {relative_path}")
+            
+            return results
+            
+        except Exception as e:
+            print(f"❌ 目錄掃描失敗: {e}")
+            return {}
     
     def build_all_embeddings(self, force_rebuild=False):
         """
@@ -205,6 +309,9 @@ def main():
   # 為所有語料庫建立嵌入向量
   python corpus_embedding_builder.py --all
   
+  # 遞歸掃描目錄並建立所有 JSON 檔案的嵌入向量
+  python corpus_embedding_builder.py --scan-dir ./Corpora
+  
   # 強制重建已存在的資料庫
   python corpus_embedding_builder.py --all --force
         """
@@ -213,9 +320,11 @@ def main():
     parser.add_argument('corpus_path', nargs='?', help='語料庫檔案路徑')
     parser.add_argument('--list', action='store_true', help='列出所有可用語料庫')
     parser.add_argument('--all', action='store_true', help='為所有語料庫建立嵌入向量')
+    parser.add_argument('--scan-dir', metavar='DIR', help='遞歸掃描目錄並為所有 JSON 檔案建立嵌入向量')
     parser.add_argument('--force', action='store_true', help='強制重建已存在的資料庫')
     parser.add_argument('--dim', type=int, default=1024, help='嵌入向量維度 (預設: 1024)')
-    
+    parser.add_argument('--model', default="bge_m3_flag", help='jina_colbert_v2 or bge_m3_flag (預設: bge_m3_flag)')
+
     args = parser.parse_args()
     
     # 列出所有可用語料庫
@@ -236,7 +345,19 @@ def main():
         return
     
     # 初始化建立器
-    builder = CorpusEmbeddingBuilder(embedding_dim=args.dim)
+    builder = CorpusEmbeddingBuilder(embedding_dim=args.dim, model=args.model)
+    
+    # 遞歸掃描目錄建立嵌入向量
+    if args.scan_dir:
+        if not Path(args.scan_dir).exists():
+            print(f"❌ 目錄不存在: {args.scan_dir}")
+            sys.exit(1)
+        
+        results = builder.build_directory_embeddings(args.scan_dir, force_rebuild=args.force)
+        
+        # 設定退出代碼：如果有任何失敗就回傳 1
+        failed_count = sum(1 for success in results.values() if not success)
+        sys.exit(1 if failed_count > 0 else 0)
     
     # 為所有語料庫建立嵌入向量
     if args.all:

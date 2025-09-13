@@ -31,6 +31,7 @@ from utils import (
     generate_db_name,
     generate_collection_name
 )
+from embedding_models import EmbeddingModel, MODELS
 
 # 固定的評估 K 值
 EVAL_K_VALUES = [1, 3, 5, 10]
@@ -75,7 +76,7 @@ def calculate_recall_at_k(retrieved_files: List[str], ground_truth: List[str],
 class QGpTQueryEvaluator:
     """QGpT 查詢評估器"""
     
-    def __init__(self, db_path: str, collection_name: str):
+    def __init__(self, db_path: str, collection_name: str, model: str = "bge_m3_flag"):
         """
         初始化查詢評估器
         
@@ -87,9 +88,9 @@ class QGpTQueryEvaluator:
         self.collection_name = collection_name
         self.client = None
         self.embedding_fn = None
-        self.initialize()
+        self.initialize(model)
     
-    def initialize(self):
+    def initialize(self, model):
         """初始化 Milvus 客戶端和嵌入函數"""
         try:
             if not Path(self.db_path).exists():
@@ -97,7 +98,7 @@ class QGpTQueryEvaluator:
             
             self.client = MilvusClient(self.db_path)
             print("🔄 初始化 BGE-M3 模型...")
-            self.embedding_fn = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True, device=device, max_length=8192)
+            self.embedding_fn = MODELS.get(model)()
 
             print("✅ BGE-M3 模型載入完成")
             
@@ -232,7 +233,7 @@ class BatchEvaluator:
         
         return None
     
-    def evaluate_test_file(self, test_file: str, db_path: str) -> Dict:
+    def evaluate_test_file(self, test_file: str, db_path: str, model: str = "bge_m3_flag") -> Dict:
         """
         評估測試檔案，計算多個 K 值的平均召回率
         
@@ -251,7 +252,7 @@ class BatchEvaluator:
         collection_name = generate_collection_name(corpus_name)
         
         # 初始化評估器
-        evaluator = QGpTQueryEvaluator(db_path, collection_name)
+        evaluator = QGpTQueryEvaluator(db_path, collection_name, model)
         
         results = []
         recall_sums = {f'recall_at_{k}': 0.0 for k in EVAL_K_VALUES}
@@ -290,15 +291,30 @@ class BatchEvaluator:
             recall_key = f'recall_at_{k}'
             avg_recalls[f'avg_{recall_key}'] = recall_sums[recall_key] / len(test_data) if test_data else 0.0
         
-        return {
+        # 儲存個別測試檔案結果
+        experiment_dir = Path("experiment")
+        experiment_dir.mkdir(exist_ok=True)
+        
+        # 生成個別結果檔案名稱：model_name_db_name.json
+        db_name = Path(db_path).stem.replace('qgpt_', '')
+        individual_result_file = experiment_dir / f"{model}_{db_name}.json"
+        
+        result_data = {
             'test_file': test_file,
             'db_path': db_path,
+            'model': model,
             'total_queries': len(test_data),
             **avg_recalls,
             'detailed_results': results
         }
+        
+        with open(individual_result_file, 'w', encoding='utf-8') as f:
+            json.dump(result_data, f, ensure_ascii=False, indent=2)
+        print(f"📄 個別結果已儲存到: {individual_result_file}")
+        
+        return result_data
     
-    def run_batch_evaluation(self, save_results: bool = True) -> Dict:
+    def run_batch_evaluation(self, save_results: bool = True, model: str = "bge_m3_flag") -> Dict:
         """
         執行批次評估，計算所有測試集的多 K 值召回率
         
@@ -329,7 +345,7 @@ class BatchEvaluator:
             
             try:
                 # 執行評估
-                result = self.evaluate_test_file(test_file, db_path)
+                result = self.evaluate_test_file(test_file, db_path, model)
                 batch_results[Path(test_file).stem] = result
                 
                 print(f"✅ 完成評估: {Path(test_file).name}")
@@ -342,7 +358,12 @@ class BatchEvaluator:
         
         # 儲存結果
         if save_results and batch_results:
-            results_file = "batch_evaluation_results_multi_k.json"
+            # 創建 experiment 目錄（如果不存在）
+            experiment_dir = Path("experiment")
+            experiment_dir.mkdir(exist_ok=True)
+            
+            # 生成結果檔案名稱：model_name_overall_results.json
+            results_file = experiment_dir / f"{model}_overall_results.json"
             with open(results_file, 'w', encoding='utf-8') as f:
                 json.dump(batch_results, f, ensure_ascii=False, indent=2)
             print(f"\n💾 評估結果已儲存到: {results_file}")
@@ -377,13 +398,14 @@ def main():
     parser.add_argument('--format', choices=['detailed', 'simple', 'json'], 
                        default='detailed', help='輸出格式 (預設: detailed)')
     parser.add_argument('--save', action='store_true', help='儲存評估結果到檔案')
-    
+    parser.add_argument('--model', default="bge_m3_flag", help='jina_colbert_v2 or bge_m3_flag (預設: bge_m3_flag)')
+
     args = parser.parse_args()
     
     # 批次評估
     if args.batch_eval:
         evaluator = BatchEvaluator()
-        results = evaluator.run_batch_evaluation(save_results=args.save)
+        results = evaluator.run_batch_evaluation(save_results=args.save, model=args.model)
         
         # 顯示總結
         if results:
@@ -411,7 +433,7 @@ def main():
         collection_name = args.collection
     
     # 初始化評估器
-    evaluator = QGpTQueryEvaluator(args.db, collection_name)
+    evaluator = QGpTQueryEvaluator(args.db, collection_name, args.model)
     
     # 測試檔案評估
     if args.test_file:
@@ -420,7 +442,7 @@ def main():
             sys.exit(1)
         
         batch_evaluator = BatchEvaluator()
-        result = batch_evaluator.evaluate_test_file(args.test_file, args.db)
+        result = batch_evaluator.evaluate_test_file(args.test_file, args.db, args.model)
         
         print(f"\n評估結果:")
         print(f"測試檔案: {result['test_file']}")
@@ -430,7 +452,13 @@ def main():
             print(f"Recall@{k}: {recall_value:.4f}")
         
         if args.save:
-            results_file = f"evaluation_{Path(args.test_file).stem}_multi_k.json"
+            # 創建 experiment 目錄
+            experiment_dir = Path("experiment")
+            experiment_dir.mkdir(exist_ok=True)
+            
+            # 生成結果檔案名稱：model_name_db_name.json
+            db_name = Path(args.db).stem.replace('qgpt_', '')
+            results_file = experiment_dir / f"{args.model}_{db_name}.json"
             with open(results_file, 'w', encoding='utf-8') as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
             print(f"詳細結果已儲存到: {results_file}")
