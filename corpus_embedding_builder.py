@@ -45,7 +45,8 @@ class CorpusEmbeddingBuilder:
         """
         self.embedding_dim = embedding_dim
         print("🔄 初始化 BGE-M3 模型...")
-        self.embedding_fn = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)
+        self.embedding_fn = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True, device=device, max_length=8192)
+
         print("✅ BGE-M3 模型載入完成")
         
     def build_embeddings(self, corpus_path, force_rebuild=False):

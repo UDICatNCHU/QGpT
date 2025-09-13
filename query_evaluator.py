@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 QGpT: Improving Table Retrieval with Question Generation from Partial Tables
-Query Evaluator
+Query Evaluator with Multi-K Recall Metrics
 
 This script evaluates query performance using test queries against built vector databases.
-It supports both single query testing and batch evaluation with ground truth comparison.
+Now supports Recall@1, Recall@3, Recall@5, Recall@10 evaluation.
 
 Usage:
     python query_evaluator.py "query text" --db database.db
@@ -32,6 +32,45 @@ from utils import (
     generate_collection_name
 )
 
+# 固定的評估 K 值
+EVAL_K_VALUES = [1, 3, 5, 10]
+
+
+def normalize_filename(filepath: str) -> str:
+    """標準化檔案路徑，只保留檔名"""
+    if isinstance(filepath, str):
+        return filepath.split('/')[-1].strip()
+    return str(filepath)
+
+
+def calculate_recall_at_k(retrieved_files: List[str], ground_truth: List[str], 
+                         k_values: List[int] = EVAL_K_VALUES) -> Dict[str, float]:
+    """
+    計算多個 K 值的召回率指標
+    
+    Args:
+        retrieved_files: 檢索到的檔案列表（已排序）
+        ground_truth: 正確答案檔案列表
+        k_values: 要計算的 K 值列表
+        
+    Returns:
+        各個 K 值的召回率字典
+    """
+    if not ground_truth:
+        return {f'recall_at_{k}': 0.0 for k in k_values}
+    
+    normalized_ground_truth = [normalize_filename(gt) for gt in ground_truth]
+    normalized_retrieved = [normalize_filename(rf) for rf in retrieved_files]
+    
+    recall_metrics = {}
+    for k in k_values:
+        # 只考慮前 k 個結果
+        top_k_retrieved = normalized_retrieved[:k]
+        hits = sum(1 for gt in normalized_ground_truth if gt in top_k_retrieved)
+        recall_metrics[f'recall_at_{k}'] = hits / len(ground_truth)
+    
+    return recall_metrics
+
 
 class QGpTQueryEvaluator:
     """QGpT 查詢評估器"""
@@ -58,7 +97,8 @@ class QGpTQueryEvaluator:
             
             self.client = MilvusClient(self.db_path)
             print("🔄 初始化 BGE-M3 模型...")
-            self.embedding_fn = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)
+            self.embedding_fn = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True, device=device, max_length=8192)
+
             print("✅ BGE-M3 模型載入完成")
             
             # 檢查集合是否存在
@@ -72,7 +112,7 @@ class QGpTQueryEvaluator:
             print(f"❌ 初始化失敗: {e}")
             sys.exit(1)
     
-    def search(self, query: str, limit: int = 5) -> List[Dict]:
+    def search(self, query: str, limit: int = 10) -> List[Dict]:
         """
         執行搜索查詢
         
@@ -113,20 +153,19 @@ class QGpTQueryEvaluator:
             print(f"❌ 搜索錯誤: {e}")
             return []
     
-    def evaluate_single_query(self, query: str, ground_truth: Optional[List[str]] = None, 
-                            limit: int = 5) -> Dict:
+    def evaluate_single_query(self, query: str, ground_truth: Optional[List[str]] = None) -> Dict:
         """
-        評估單一查詢
+        評估單一查詢，計算多個 K 值的召回率
         
         Args:
             query: 查詢字符串
             ground_truth: 正確答案列表（檔案名或ID）
-            limit: 返回結果數量
             
         Returns:
-            評估結果
+            評估結果，包含多個 K 值的召回率
         """
-        results = self.search(query, limit)
+        # 搜尋 top-10 結果（足夠計算所有 K 值）
+        results = self.search(query, max(EVAL_K_VALUES))
         
         evaluation = {
             'query': query,
@@ -134,39 +173,11 @@ class QGpTQueryEvaluator:
             'results': results
         }
         
-        # 如果有正確答案，計算檢索評估指標
+        # 如果有正確答案，計算召回率指標
         if ground_truth:
-            retrieved_ids = [r['original_id'] for r in results]
             retrieved_files = [r['filename'] for r in results]
-            
-            # 標準化檔案路徑以進行比較（移除路徑前綴，只比較檔名）
-            def normalize_filename(filepath):
-                if isinstance(filepath, str):
-                    # 移除路徑前綴，只保留檔名
-                    return filepath.split('/')[-1].strip()
-                return str(filepath)
-            
-            normalized_ground_truth = [normalize_filename(gt) for gt in ground_truth]
-            normalized_retrieved_files = [normalize_filename(rf) for rf in retrieved_files]
-            
-            # 計算 Recall@K (召回率)
-            hits_by_id = sum(1 for gt in ground_truth if str(gt) in [str(rid) for rid in retrieved_ids])
-            hits_by_file = sum(1 for gt in normalized_ground_truth if gt in normalized_retrieved_files)
-            
-            # 計算指標
-            recall_at_k = hits_by_file / len(ground_truth) if ground_truth else 0
-            precision_at_k = hits_by_file / len(results) if results else 0
-            
-            evaluation.update({
-                'ground_truth': ground_truth,
-                'hits_by_id': hits_by_id,
-                'hits_by_file': hits_by_file,
-                'recall_at_k': recall_at_k,  # 標準召回率指標
-                'precision_at_k': precision_at_k,  # 標準精確率指標
-                # 保留舊的指標名稱以向後兼容
-                'hit_rate_by_id': hits_by_id / len(ground_truth) if ground_truth else 0,
-                'hit_rate_by_file': recall_at_k
-            })
+            recall_metrics = calculate_recall_at_k(retrieved_files, ground_truth, EVAL_K_VALUES)
+            evaluation.update(recall_metrics)
         
         return evaluation
 
@@ -221,17 +232,16 @@ class BatchEvaluator:
         
         return None
     
-    def evaluate_test_file(self, test_file: str, db_path: str, limit: int = 5) -> Dict:
+    def evaluate_test_file(self, test_file: str, db_path: str) -> Dict:
         """
-        評估測試檔案
+        評估測試檔案，計算多個 K 值的平均召回率
         
         Args:
             test_file: 測試檔案路徑
             db_path: 資料庫路徑
-            limit: 每個查詢返回的結果數量
             
         Returns:
-            評估結果
+            評估結果，包含各個 K 值的平均召回率
         """
         # 載入測試資料
         test_data = load_json_dataset(test_file)
@@ -244,8 +254,7 @@ class BatchEvaluator:
         evaluator = QGpTQueryEvaluator(db_path, collection_name)
         
         results = []
-        total_recall = 0
-        total_precision = 0
+        recall_sums = {f'recall_at_{k}': 0.0 for k in EVAL_K_VALUES}
         
         print(f"🔄 評估測試檔案: {Path(test_file).name}")
         print(f"   查詢數量: {len(test_data)}")
@@ -262,41 +271,38 @@ class BatchEvaluator:
                 pass
             
             # 執行評估
-            eval_result = evaluator.evaluate_single_query(query, ground_truth, limit)
+            eval_result = evaluator.evaluate_single_query(query, ground_truth)
             results.append(eval_result)
             
-            # 累計指標（使用標準的資訊檢索指標）
-            if 'recall_at_k' in eval_result:
-                total_recall += eval_result['recall_at_k']
-            if 'precision_at_k' in eval_result:
-                total_precision += eval_result['precision_at_k']
+            # 累計各個 K 值的召回率
+            for k in EVAL_K_VALUES:
+                recall_key = f'recall_at_{k}'
+                if recall_key in eval_result:
+                    recall_sums[recall_key] += eval_result[recall_key]
             
             # 顯示進度
             if (i + 1) % 10 == 0:
                 print(f"   處理進度: {i + 1}/{len(test_data)}")
         
         # 計算平均指標
-        avg_recall = total_recall / len(test_data) if test_data else 0
-        avg_precision = total_precision / len(test_data) if test_data else 0
+        avg_recalls = {}
+        for k in EVAL_K_VALUES:
+            recall_key = f'recall_at_{k}'
+            avg_recalls[f'avg_{recall_key}'] = recall_sums[recall_key] / len(test_data) if test_data else 0.0
         
         return {
             'test_file': test_file,
             'db_path': db_path,
             'total_queries': len(test_data),
-            'avg_recall_at_k': avg_recall,      # 標準召回率指標 (Recall@K)
-            'avg_precision_at_k': avg_precision, # 標準精確率指標 (Precision@K)
-            # 保留舊的指標名稱以向後兼容
-            'avg_hit_rate': avg_recall,
-            'avg_precision': avg_precision,
+            **avg_recalls,
             'detailed_results': results
         }
     
-    def run_batch_evaluation(self, limit: int = 5, save_results: bool = True) -> Dict:
+    def run_batch_evaluation(self, save_results: bool = True) -> Dict:
         """
-        執行批次評估
+        執行批次評估，計算所有測試集的多 K 值召回率
         
         Args:
-            limit: 每個查詢返回的結果數量
             save_results: 是否儲存詳細結果
             
         Returns:
@@ -310,6 +316,7 @@ class BatchEvaluator:
         batch_results = {}
         
         print(f"🔄 開始批次評估，找到 {len(test_files)} 個測試檔案")
+        print(f"📊 評估指標: {', '.join(f'Recall@{k}' for k in EVAL_K_VALUES)}")
         
         for test_file in test_files:
             print(f"\n{'='*60}")
@@ -322,19 +329,20 @@ class BatchEvaluator:
             
             try:
                 # 執行評估
-                result = self.evaluate_test_file(test_file, db_path, limit)
+                result = self.evaluate_test_file(test_file, db_path)
                 batch_results[Path(test_file).stem] = result
                 
                 print(f"✅ 完成評估: {Path(test_file).name}")
-                print(f"   平均召回率 (Recall@{limit}): {result['avg_recall_at_k']:.4f}")
-                print(f"   平均精確率 (Precision@{limit}): {result['avg_precision_at_k']:.4f}")
+                for k in EVAL_K_VALUES:
+                    recall_value = result[f'avg_recall_at_{k}']
+                    print(f"   Recall@{k}: {recall_value:.4f}")
                 
             except Exception as e:
                 print(f"❌ 評估失敗: {Path(test_file).name} - {e}")
         
         # 儲存結果
         if save_results and batch_results:
-            results_file = f"batch_evaluation_results_top{limit}.json"
+            results_file = "batch_evaluation_results_multi_k.json"
             with open(results_file, 'w', encoding='utf-8') as f:
                 json.dump(batch_results, f, ensure_ascii=False, indent=2)
             print(f"\n💾 評估結果已儲存到: {results_file}")
@@ -345,21 +353,18 @@ class BatchEvaluator:
 def main():
     """主程式"""
     parser = argparse.ArgumentParser(
-        description='QGpT 查詢評估器',
+        description='QGpT 查詢評估器 - 多 K 值召回率版本',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 範例:
-  # 單一查詢測試
+  # 單一查詢測試（會計算 Recall@1,3,5,10）
   python query_evaluator.py "財務報表" --db qgpt_Table1_mimo_ch.db
   
   # 使用測試檔案評估
   python query_evaluator.py --test-file Test_Query_and_GroundTruth_Table/MiMoTable-English_test.json --db qgpt_Table1_mimo_en.db
   
-  # 批次評估所有測試集
+  # 批次評估所有測試集（計算多個 K 值的召回率）
   python query_evaluator.py --batch-eval
-  
-  # 批次評估並指定返回結果數量
-  python query_evaluator.py --batch-eval --limit 10
         """
     )
     
@@ -368,7 +373,7 @@ def main():
     parser.add_argument('--collection', help='向量集合名稱（自動從資料庫名稱推導）')
     parser.add_argument('--test-file', help='測試查詢檔案路徑')
     parser.add_argument('--batch-eval', action='store_true', help='批次評估所有測試集')
-    parser.add_argument('--limit', type=int, default=5, help='返回結果數量 (預設: 5)')
+    parser.add_argument('--limit', type=int, default=10, help='顯示結果數量 (預設: 10)')
     parser.add_argument('--format', choices=['detailed', 'simple', 'json'], 
                        default='detailed', help='輸出格式 (預設: detailed)')
     parser.add_argument('--save', action='store_true', help='儲存評估結果到檔案')
@@ -378,18 +383,18 @@ def main():
     # 批次評估
     if args.batch_eval:
         evaluator = BatchEvaluator()
-        results = evaluator.run_batch_evaluation(limit=args.limit, save_results=args.save)
+        results = evaluator.run_batch_evaluation(save_results=args.save)
         
         # 顯示總結
         if results:
             print(f"\n{'='*60}")
             print("批次評估總結:")
             for test_name, result in results.items():
-                limit = 5  # 預設值，實際值應該從參數中取得
                 print(f"  {test_name}:")
                 print(f"    查詢數量: {result['total_queries']}")
-                print(f"    平均召回率 (Recall@{limit}): {result['avg_recall_at_k']:.4f}")
-                print(f"    平均精確率 (Precision@{limit}): {result['avg_precision_at_k']:.4f}")
+                for k in EVAL_K_VALUES:
+                    recall_value = result[f'avg_recall_at_{k}']
+                    print(f"    Recall@{k}: {recall_value:.4f}")
         
         return
     
@@ -415,16 +420,17 @@ def main():
             sys.exit(1)
         
         batch_evaluator = BatchEvaluator()
-        result = batch_evaluator.evaluate_test_file(args.test_file, args.db, args.limit)
+        result = batch_evaluator.evaluate_test_file(args.test_file, args.db)
         
         print(f"\n評估結果:")
         print(f"測試檔案: {result['test_file']}")
         print(f"查詢總數: {result['total_queries']}")
-        print(f"平均召回率 (Recall@{args.limit}): {result['avg_recall_at_k']:.4f}")
-        print(f"平均精確率 (Precision@{args.limit}): {result['avg_precision_at_k']:.4f}")
+        for k in EVAL_K_VALUES:
+            recall_value = result[f'avg_recall_at_{k}']
+            print(f"Recall@{k}: {recall_value:.4f}")
         
         if args.save:
-            results_file = f"evaluation_{Path(args.test_file).stem}.json"
+            results_file = f"evaluation_{Path(args.test_file).stem}_multi_k.json"
             with open(results_file, 'w', encoding='utf-8') as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
             print(f"詳細結果已儲存到: {results_file}")
