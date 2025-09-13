@@ -45,10 +45,9 @@ class QGpTSearchEngine:
         if not self.db_path:
             self.db_path = self.find_default_database()
         
-        # 如果沒有指定集合名稱，從資料庫路徑推導
-        if not self.collection_name and self.db_path:
-            corpus_name = Path(self.db_path).stem.replace('qgpt_', '')
-            self.collection_name = generate_collection_name(corpus_name)
+        # 如果沒有指定集合名稱，使用預設名稱
+        if not self.collection_name:
+            self.collection_name = "corpus"  # Standard collection name
         
         self.initialize()
     
@@ -187,10 +186,9 @@ def main():
         print("可用的 QGpT 資料庫檔案:")
         for i, db_file in enumerate(db_files, 1):
             corpus_name = db_file.stem.replace('qgpt_', '')
-            collection_name = generate_collection_name(corpus_name)
             print(f"  {i}. {db_file}")
             print(f"     語料庫: {corpus_name}")
-            print(f"     集合: {collection_name}")
+            print(f"     集合: corpus")
             print()
         return
     

@@ -11,6 +11,9 @@ Usage:
     python query_evaluator.py --test-file test_queries.json --db database.db
     python query_evaluator.py --batch-eval  # 批次評估所有測試集
 
+    python query_evaluator.py --test-file test_dataset/MiMoTable-Chinese_test.json --db db/bge_flag/qgpt_T1_MTLV_mimo_ch_1k_token.db
+
+
 Author: QGpT Research Team
 Repository: https://github.com/UDICatNCHU/QGpT
 """
@@ -62,8 +65,14 @@ class QGpTQueryEvaluator:
             print("✅ BGE-M3 模型載入完成")
             
             # 檢查集合是否存在
-            if not self.client.has_collection(collection_name=self.collection_name):
-                raise ValueError(f"找不到集合 '{self.collection_name}' 在資料庫 '{self.db_path}'")
+            available_collections = self.client.list_collections()
+            if self.collection_name not in available_collections:
+                # 自動使用第一個可用集合
+                if available_collections:
+                    print(f"⚠️  集合 '{self.collection_name}' 不存在，自動使用: {available_collections[0]}")
+                    self.collection_name = available_collections[0]
+                else:
+                    raise ValueError(f"資料庫 '{self.db_path}' 中沒有任何集合")
             
             print(f"✅ 成功連接到資料庫: {self.db_path}")
             print(f"✅ 使用集合: {self.collection_name}")
