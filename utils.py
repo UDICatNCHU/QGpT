@@ -66,7 +66,6 @@ def extract_corpus_name_from_path(file_path):
     corpora_index = path_obj.parts.index('Corpora')
     name_parts = list(path_obj.parts[corpora_index + 1:-1])  # 排除檔名
     name_parts.append(path_obj.stem)  # 加入檔名（無副檔名）
-    print(name_parts)
     return '_'.join(_normalize_name(part) for part in name_parts)
 
 
