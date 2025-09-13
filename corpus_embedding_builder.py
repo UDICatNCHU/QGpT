@@ -1,17 +1,15 @@
-#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-QGpT: Improved Table Retrieval with Question Generation from Partial Tables
-Multi-Model Corpus Embedding Builder
+QGpT: Improving Table Retrieval with Question Generation from Partial Tables
+Corpus Embedding Builder
 
-This script builds vector embeddings for table corpora using multiple embedding models.
-It processes table data from JSON files and creates model-specific vector databases.
+This script builds vector embeddings for table corpora using the QGpT framework.
+It processes table data from JSON files and creates vector databases with corpus-specific naming.
 
 Usage:
-    python corpus_embedding_builder.py [corpus_file_path] --model [model_name]
-    python corpus_embedding_builder.py --list         # List available corpora
-    python corpus_embedding_builder.py --list-models  # List available models
-    python corpus_embedding_builder.py --all          # Build all corpora with default model
-    python corpus_embedding_builder.py --folder [path] # Build all files in folder recursively
+    python corpus_embedding_builder.py [corpus_file_path]
+    python corpus_embedding_builder.py --list  # 列出所有可用語料庫
+    python corpus_embedding_builder.py --all   # 建立所有語料庫的 embedding
 
 Author: QGpT Research Team
 Repository: https://github.com/UDICatNCHU/QGpT
@@ -19,311 +17,242 @@ Repository: https://github.com/UDICatNCHU/QGpT
 
 import argparse
 import sys
-import warnings
 from pathlib import Path
-from typing import List, Dict
-from loguru import logger
+from typing import List, Dict, Optional
 from pymilvus import MilvusClient
-import os
-from concurrent.futures import ProcessPoolExecutor
-import torch
-import multiprocessing as mp
+from FlagEmbedding import BGEM3FlagModel
 
-# Suppress package warnings
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-
-from embedding_models import BGE_M3_Flag, BGE_M3_Milvus, JinaColBERT_V2
 from utils import (
     load_json_dataset, 
     preprocess_text, 
     extract_corpus_name_from_path,
+    generate_db_name,
+    generate_collection_name,
     get_corpus_files,
-    validate_corpus_structure,
-    generate_db_name
+    validate_corpus_structure
 )
 
-# Constants - eliminate magic numbers
-MAX_DB_NAME_LENGTH = 32  # milvus_lite limitation
-SUPPORTED_EXTENSIONS = {'.json'}  # Supported file types
-DEFAULT_BATCH_SIZE = 64  # Model batch size
 
-# Available models configuration
-AVAILABLE_MODELS = {
-    "bge_flag": BGE_M3_Flag,
-    "bge_milvus": BGE_M3_Milvus,
-    "jina_colbert": JinaColBERT_V2
-}
-
-
-def create_safe_db_path(model_name: str, corpus_path: Path) -> Path:
-    """Create database path that respects milvus_lite constraints"""
-    corpus_name = extract_corpus_name_from_path(str(corpus_path))
-    base_name = generate_db_name(corpus_name)
-    db_path = Path(f"db/{model_name}/{base_name}")
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    return db_path
-
-
-def normalize_vector(vec) -> List[float]:
-    """Convert various vector formats to float32 list"""
-    if hasattr(vec, 'astype'):  # numpy array
-        return vec.astype('float32').tolist()
-    if isinstance(vec, (list, tuple)):
-        return list(vec)
-    # Let Milvus handle other cases and report errors
-    return vec
-
-
-def extract_document_data(item: Dict) -> tuple[str, Dict]:
-    """Extract preprocessed text and metadata from corpus item."""
-    return (
-        preprocess_text(item['Text']),
-        {
-            'id': item['id'],
-            'filename': item.get('FileName', ''),
-            'sheet_name': item.get('SheetName', '')
-        }
-    )
-
-
-def build_corpus_embedding(corpus_path: Path, model_name: str, force_rebuild: bool = False, gpu_id: int = 0, batch_size: int = DEFAULT_BATCH_SIZE) -> bool:
-    """Build embedding for corpus file with specified model."""
-    if model_name not in AVAILABLE_MODELS:
-        available = ", ".join(AVAILABLE_MODELS.keys())
-        logger.error(f"Unknown model: {model_name}. Available: {available}")
-        return False
-     
-    # Load and validate data
-    try:
-        data = load_json_dataset(str(corpus_path))
-    except Exception as e:
-        logger.error(f"Failed to load {corpus_path}: {e}")
-        return False
+class CorpusEmbeddingBuilder:
+    """語料庫嵌入向量建立器"""
     
-    if not validate_corpus_structure(data):
-        logger.error(f"Invalid corpus structure in file: {corpus_path}")
-        return False
+    def __init__(self, embedding_dim=1024):
+        """
+        初始化建立器
         
-    # Set GPU device for this process
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-    
-    # Initialize model with batch size
-    try:
-        model = AVAILABLE_MODELS[model_name](batch_size=batch_size)
+        Args:
+            embedding_dim: 嵌入向量維度 (BGE-M3 輸出 1024 維)
+        """
+        self.embedding_dim = embedding_dim
+        print("🔄 初始化 BGE-M3 模型...")
+        self.embedding_fn = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)
+        print("✅ BGE-M3 模型載入完成")
         
-    except Exception as e:
-        logger.error(f"Failed to initialize model {model_name} on GPU {gpu_id}: {e}")
-        return False
-    
-    # Setup database path
-    db_path = create_safe_db_path(model_name, corpus_path)
-    collection_name = "corpus"
-
-    # Check if database exists
-    if db_path.exists() and not force_rebuild:
-        logger.info(f"Database exists: {db_path}, skipping (use --force to rebuild)")
-        return True
-    
-    # Extract documents and metadata  
-    try:
-        documents, metadata = zip(*[extract_document_data(item) for item in data])
-        documents, metadata = list(documents), list(metadata)
-    except Exception as e:
-        logger.error(f"Failed to preprocess documents: {e}")
-        return False
-    
-    try:
-        result = model.encode(documents)
-        vectors = result['dense_vecs']
-        logger.info(f"Generated {len(vectors)} vectors of dimension {len(vectors[0])}")
+    def build_embeddings(self, corpus_path, force_rebuild=False):
+        """
+        為指定語料庫建立嵌入向量
         
-    except Exception as e:
-        logger.error(f"Failed to generate embeddings: {e}")
-        return False
+        Args:
+            corpus_path: 語料庫檔案路徑
+            force_rebuild: 是否強制重建（即使資料庫已存在）
+            
+        Returns:
+            是否成功建立
+        """
+        try:
+            # 提取語料庫名稱和生成資料庫名稱
+            corpus_name = extract_corpus_name_from_path(corpus_path)
+            db_name = generate_db_name(corpus_name)
+            collection_name = generate_collection_name(corpus_name)
+            
+            print(f"🔄 處理語料庫: {corpus_name}")
+            print(f"   檔案路徑: {corpus_path}")
+            print(f"   資料庫名稱: {db_name}")
+            print(f"   集合名稱: {collection_name}")
+            
+            # 檢查資料庫是否已存在
+            if Path(db_name).exists() and not force_rebuild:
+                print(f"ℹ️  資料庫 '{db_name}' 已存在，跳過建立（使用 --force 強制重建）")
+                return True
+            
+            # 載入語料庫資料
+            print("🔄 載入語料庫資料...")
+            data = load_json_dataset(corpus_path)
+            
+            if not validate_corpus_structure(data):
+                print(f"❌ 語料庫結構驗證失敗: {corpus_path}")
+                return False
+            
+            print(f"✅ 載入了 {len(data)} 個表格文件")
+            
+            # 建立 Milvus 向量資料庫客戶端
+            print("🔄 初始化向量資料庫...")
+            client = MilvusClient(db_name)
+            
+            # 刪除現有集合（如果存在）並建立新集合
+            if client.has_collection(collection_name=collection_name):
+                client.drop_collection(collection_name=collection_name)
+                print("🗑️  已刪除現有集合")
+            
+            # 建立新的向量集合
+            client.create_collection(
+                collection_name=collection_name,
+                dimension=self.embedding_dim,
+            )
+            print("✅ 建立新的向量集合")
+            
+            # 準備文件資料
+            print("🔄 預處理文件...")
+            documents = []
+            metadata = []
+            
+            for item in data:
+                # 預處理文字
+                clean_text = preprocess_text(item['Text'])
+                documents.append(clean_text)
+                
+                # 保存元資料
+                metadata.append({
+                    'id': item['id'],
+                    'filename': item.get('FileName', ''),
+                    'sheet_name': item.get('SheetName', '')
+                })
+            
+            # 生成嵌入向量
+            print("🔄 生成嵌入向量...")
+            vectors = self.embedding_fn.encode(documents)['dense_vecs']  # BGE-M3 使用 encode 方法
+            print(f"向量維度: {len(vectors[0])}, 向量數量: {len(vectors)}")
+            
+            # 準備插入資料
+            print("🔄 準備插入資料...")
+            insert_data = []
+            for i, (doc, vec, meta) in enumerate(zip(documents, vectors, metadata)):
+                insert_data.append({
+                    "id": i,
+                    "vector": vec.astype('float32').tolist(),  # 轉換為 float32 並轉為 list
+                    "text": doc,  # 限制文字長度以節省空間
+                    "original_id": meta['id'],
+                    "filename": meta['filename'],
+                    "sheet_name": meta['sheet_name']
+                })
+            
+            # 插入資料到 Milvus
+            print("🔄 插入資料到向量資料庫...")
+            client.insert(collection_name=collection_name, data=insert_data)
+            
+            print(f"✅ 成功建立語料庫 '{corpus_name}' 的嵌入向量")
+            print(f"   資料庫檔案: {db_name}")
+            print(f"   記錄數量: {len(insert_data)}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ 建立嵌入向量失敗: {e}")
+            return False
     
-    # Setup and populate database
-    try:
-        _setup_milvus_database(db_path, collection_name, model.dimension, documents, vectors, metadata)
-    except Exception as e:
-        logger.error(f"Failed to setup database: {e}")
-        return False
-    
-    logger.success(f"Successfully built embeddings for '{corpus_path.name}' at {db_path} using {model.name}")
-    return True
+    def build_all_embeddings(self, force_rebuild=False):
+        """
+        為所有可用語料庫建立嵌入向量
+        
+        Args:
+            force_rebuild: 是否強制重建
+            
+        Returns:
+            建立結果字典 {corpus_name: success}
+        """
+        corpus_files = get_corpus_files()
+        results = {}
+        
+        if not corpus_files:
+            print("⚠️  沒有找到任何語料庫檔案")
+            return results
+        
+        print(f"🔄 找到 {len(corpus_files)} 個語料庫檔案")
+        
+        for i, corpus_info in enumerate(corpus_files, 1):
+            print(f"\n{'='*60}")
+            print(f"處理語料庫 {i}/{len(corpus_files)}")
+            success = self.build_embeddings(corpus_info['path'], force_rebuild)
+            results[corpus_info['name']] = success
+        
+        # 顯示總結
+        print(f"\n{'='*60}")
+        print("建立完成總結:")
+        successful = sum(1 for success in results.values() if success)
+        print(f"成功: {successful}/{len(results)}")
+        
+        for corpus_name, success in results.items():
+            status = "✅" if success else "❌"
+            print(f"  {status} {corpus_name}")
+        
+        return results
 
 
-def _setup_milvus_database(db_path: Path, collection_name: str, dimension: int, 
-                          documents: List[str], vectors: List, metadata: List[Dict]) -> None:
-    """Setup Milvus database and insert data"""
-    client = MilvusClient(str(db_path))
-    
-    # Drop existing collection if exists
-    if client.has_collection(collection_name):
-        client.drop_collection(collection_name)
-    
-    # Create new collection
-    actual_dimension = dimension if dimension > 0 else len(vectors[0])
-    client.create_collection(collection_name, dimension=actual_dimension)
-    
-    # Prepare and insert data
-    insert_data = []
-    for i, (doc, vec, meta) in enumerate(zip(documents, vectors, metadata)):
-        insert_data.append({
-            "id": i,
-            "vector": normalize_vector(vec),
-            "text": doc,
-            "original_id": meta['id'],
-            "filename": meta['filename'],
-            "sheet_name": meta['sheet_name']
-        })
-    
-    client.insert(collection_name, insert_data)
-
-
-def find_corpus_files_in_folder(folder_path: Path) -> List[Path]:
-    """Recursively find all corpus files in folder"""
-    if not folder_path.is_dir():
-        raise ValueError(f"Not a directory: {folder_path}")
-    
-    corpus_files = []
-    for file_path in folder_path.rglob("*"):
-        if file_path.is_file() and file_path.suffix in SUPPORTED_EXTENSIONS:
-            corpus_files.append(file_path)
-    
-    return sorted(corpus_files)
-
-
-def _process_corpus_batch(corpus_items, model_name: str, force_rebuild: bool) -> int:
-    """Process corpus files in parallel"""
-    if not corpus_items:
-        return 0
-    
-    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
-    max_workers = min(gpu_count, len(corpus_items))
-    
-    work_args = [
-        (item, model_name, force_rebuild, i % gpu_count if torch.cuda.is_available() else 0)
-        for i, item in enumerate(corpus_items)
-    ]
-    
-    with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context('spawn')) as executor:
-        results = list(executor.map(_corpus_worker, work_args))
-    
-    return sum(results)
-
-
-def _corpus_worker(args_tuple) -> bool:
-    """Worker function for parallel processing"""
-    item, model_name, force_rebuild, gpu_id = args_tuple
-    corpus_path = Path(item['path']) if isinstance(item, dict) else item
-    return build_corpus_embedding(corpus_path, model_name, force_rebuild, gpu_id)
-
-
-def build_all_corpora(args) -> None:
-    """Build embeddings for all available corpora"""
-    corpus_files = get_corpus_files()
-    if not corpus_files:
-        logger.warning("No corpus files found")
-        return
-    
-    logger.info(f"Building embeddings for {len(corpus_files)} corpora using {args.model}")
-    success_count = _process_corpus_batch(corpus_files, args.model, args.force)
-    logger.success(f"Completed: {success_count}/{len(corpus_files)} successful")
-
-
-def build_folder_corpora(args) -> None:
-    """Build embeddings for all corpus files in folder"""
-    folder_path = Path(args.folder)
-    
-    try:
-        corpus_files = find_corpus_files_in_folder(folder_path)
-    except ValueError as e:
-        logger.error(str(e))
-        sys.exit(1)
-    
-    if not corpus_files:
-        logger.warning(f"No corpus files found in {folder_path}")
-        return
-    
-    logger.info(f"Found {len(corpus_files)} corpus files in {folder_path}")
-    success_count = _process_corpus_batch(corpus_files, args.model, args.force)
-    logger.success(f"Completed folder processing: {success_count}/{len(corpus_files)} successful")
-
-
-def build_single_corpus(args) -> None:
-    """Build embedding for single corpus file"""
-    corpus_path = Path(args.corpus_path)
-    
-    if not corpus_path.exists():
-        logger.error(f"File not found: {args.corpus_path}")
-        sys.exit(1)
-    
-    if corpus_path.suffix not in SUPPORTED_EXTENSIONS:
-        logger.error(f"Unsupported file type: {corpus_path.suffix}. Supported: {', '.join(SUPPORTED_EXTENSIONS)}")
-        sys.exit(1)
-    
-    if not build_corpus_embedding(corpus_path, args.model, args.force):
-        sys.exit(1)
-
-
-def parse_arguments() -> argparse.Namespace:
-    """Parse and validate command line arguments"""
+def main():
+    """主程式"""
     parser = argparse.ArgumentParser(
-        description='QGpT multi-model corpus embedding builder',
+        description='QGpT 語料庫嵌入向量建立器',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  # Build single corpus
-  python corpus_embedding_builder.py corpus.json --model bge_flag
+範例:
+  # 為指定語料庫建立嵌入向量
+  python corpus_embedding_builder.py Corpora/Table1_mimo_table_length_variation/mimo_ch/1k_token.json
   
-  # Build all files in folder recursively
-  python corpus_embedding_builder.py --folder /path/to/corpora --model bge_milvus
-  
-  # List available corpora and models
+  # 列出所有可用語料庫
   python corpus_embedding_builder.py --list
-  python corpus_embedding_builder.py --list-models
   
-  # Build all corpora with default model
-  python corpus_embedding_builder.py --all --model bge_milvus
+  # 為所有語料庫建立嵌入向量
+  python corpus_embedding_builder.py --all
   
-  # Force rebuild existing databases
+  # 強制重建已存在的資料庫
   python corpus_embedding_builder.py --all --force
         """
     )
     
-    parser.add_argument('corpus_path', nargs='?', help='Corpus file path')
-    parser.add_argument('--model', default='bge_flag', 
-                       choices=list(AVAILABLE_MODELS.keys()),
-                       help='Embedding model to use')
-    parser.add_argument('--list', action='store_true', help='List available corpora')
-    parser.add_argument('--list-models', action='store_true', help='List available models')
-    parser.add_argument('--all', action='store_true', help='Build all corpora')
-    parser.add_argument('--folder', help='Build all corpus files in folder recursively')
-    parser.add_argument('--force', action='store_true', help='Force rebuild existing databases')
+    parser.add_argument('corpus_path', nargs='?', help='語料庫檔案路徑')
+    parser.add_argument('--list', action='store_true', help='列出所有可用語料庫')
+    parser.add_argument('--all', action='store_true', help='為所有語料庫建立嵌入向量')
+    parser.add_argument('--force', action='store_true', help='強制重建已存在的資料庫')
+    parser.add_argument('--dim', type=int, default=1024, help='嵌入向量維度 (預設: 1024)')
     
-    return parser.parse_args()
-
-
-def main() -> None:
-    """Main entry point"""
-    args = parse_arguments()
+    args = parser.parse_args()
     
+    # 列出所有可用語料庫
     if args.list:
-        # Handle list corpora
+        corpus_files = get_corpus_files()
+        if not corpus_files:
+            print("沒有找到任何語料庫檔案")
+            return
+        
+        print("可用的語料庫檔案:")
+        print("=" * 80)
+        for i, corpus_info in enumerate(corpus_files, 1):
+            print(f"{i:2d}. 名稱: {corpus_info['name']}")
+            print(f"     路徑: {corpus_info['path']}")
+            print(f"     資料庫: {corpus_info['db_name']}")
+            print(f"     集合: {corpus_info['collection_name']}")
+            print()
         return
-    if args.list_models:
-        # Handle list models  
-        return
+    
+    # 初始化建立器
+    builder = CorpusEmbeddingBuilder(embedding_dim=args.dim)
+    
+    # 為所有語料庫建立嵌入向量
     if args.all:
-        build_all_corpora(args)
-    elif args.folder:
-        build_folder_corpora(args)
-    elif args.corpus_path:
-        build_single_corpus(args)
-    else:
-        parse_arguments().print_help()
+        builder.build_all_embeddings(force_rebuild=args.force)
+        return
+    
+    # 為指定語料庫建立嵌入向量
+    if args.corpus_path:
+        if not Path(args.corpus_path).exists():
+            print(f"❌ 找不到檔案: {args.corpus_path}")
+            sys.exit(1)
+        
+        success = builder.build_embeddings(args.corpus_path, force_rebuild=args.force)
+        sys.exit(0 if success else 1)
+    
+    # 如果沒有提供參數，顯示幫助
+    parser.print_help()
 
 
 if __name__ == "__main__":

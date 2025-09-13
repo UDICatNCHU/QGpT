@@ -11,9 +11,6 @@ Usage:
     python query_evaluator.py --test-file test_queries.json --db database.db
     python query_evaluator.py --batch-eval  # 批次評估所有測試集
 
-    python query_evaluator.py --test-file test_dataset/MiMoTable-Chinese_test.json --db db/bge_flag/qgpt_T1_MTLV_mimo_ch_1k_token.db
-
-
 Author: QGpT Research Team
 Repository: https://github.com/UDICatNCHU/QGpT
 """
@@ -26,7 +23,6 @@ from typing import List, Dict, Optional, Tuple
 from pymilvus import MilvusClient
 from FlagEmbedding import BGEM3FlagModel
 
-from embedding_models import BGE_M3_Flag, BGE_M3_Milvus, JinaColBERT_V2
 from utils import (
     load_json_dataset,
     format_search_results,
@@ -40,18 +36,16 @@ from utils import (
 class QGpTQueryEvaluator:
     """QGpT 查詢評估器"""
     
-    def __init__(self, db_path: str, collection_name: str, model_name: str = "bge_m3_flag"):
+    def __init__(self, db_path: str, collection_name: str):
         """
         初始化查詢評估器
         
         Args:
             db_path: 向量資料庫路徑
             collection_name: 向量集合名稱
-            model_name: embedding 模型名稱
         """
         self.db_path = db_path
         self.collection_name = collection_name
-        self.model_name = model_name
         self.client = None
         self.embedding_fn = None
         self.initialize()
@@ -63,19 +57,13 @@ class QGpTQueryEvaluator:
                 raise FileNotFoundError(f"找不到資料庫檔案: {self.db_path}")
             
             self.client = MilvusClient(self.db_path)
-            print(f"🔄 初始化 {self.model_name} 模型...")
-            self.embedding_fn = self._load_embedding_model(self.model_name)
-            print(f"✅ {self.model_name} 模型載入完成")
+            print("🔄 初始化 BGE-M3 模型...")
+            self.embedding_fn = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)
+            print("✅ BGE-M3 模型載入完成")
             
             # 檢查集合是否存在
-            available_collections = self.client.list_collections()
-            if self.collection_name not in available_collections:
-                # 自動使用第一個可用集合
-                if available_collections:
-                    print(f"⚠️  集合 '{self.collection_name}' 不存在，自動使用: {available_collections[0]}")
-                    self.collection_name = available_collections[0]
-                else:
-                    raise ValueError(f"資料庫 '{self.db_path}' 中沒有任何集合")
+            if not self.client.has_collection(collection_name=self.collection_name):
+                raise ValueError(f"找不到集合 '{self.collection_name}' 在資料庫 '{self.db_path}'")
             
             print(f"✅ 成功連接到資料庫: {self.db_path}")
             print(f"✅ 使用集合: {self.collection_name}")
@@ -83,20 +71,6 @@ class QGpTQueryEvaluator:
         except Exception as e:
             print(f"❌ 初始化失敗: {e}")
             sys.exit(1)
-    
-    def _load_embedding_model(self, model_name: str):
-        """載入指定的 embedding 模型"""
-        model_mapping = {
-            "bge_m3_flag": BGE_M3_Flag,
-            "bge_m3_milvus": BGE_M3_Milvus,
-            "jina_colbert_v2": JinaColBERT_V2
-        }
-        
-        if model_name not in model_mapping:
-            available_models = ", ".join(model_mapping.keys())
-            raise ValueError(f"不支援的模型: {model_name}。可用模型: {available_models}")
-        
-        return model_mapping[model_name]()
     
     def search(self, query: str, limit: int = 5) -> List[Dict]:
         """
@@ -110,9 +84,8 @@ class QGpTQueryEvaluator:
             搜索結果列表
         """
         try:
-            # 將查詢轉換為向量
-            query_embeddings = self.embedding_fn.encode([query])
-            query_vector = query_embeddings['dense_vecs'][0].astype('float32').tolist()
+            # 將查詢轉換為向量 (使用 BGE-M3)
+            query_vector = self.embedding_fn.encode([query])['dense_vecs'][0].astype('float32').tolist()
             
             # 執行搜索
             search_results = self.client.search(
@@ -141,7 +114,7 @@ class QGpTQueryEvaluator:
             return []
     
     def evaluate_single_query(self, query: str, ground_truth: Optional[List[str]] = None, 
-                            limit: int = 10) -> Dict:
+                            limit: int = 5) -> Dict:
         """
         評估單一查詢
         
@@ -176,36 +149,23 @@ class QGpTQueryEvaluator:
             normalized_ground_truth = [normalize_filename(gt) for gt in ground_truth]
             normalized_retrieved_files = [normalize_filename(rf) for rf in retrieved_files]
             
-            # 計算多個 K 值的 Recall@K
-            recall_metrics = {}
-            precision_metrics = {}
-            
-            for k in [1, 3, 5, 10]:
-                if k <= len(results):
-                    # 只考慮前 k 個結果
-                    top_k_files = normalized_retrieved_files[:k]
-                    hits_at_k = sum(1 for gt in normalized_ground_truth if gt in top_k_files)
-                    
-                    recall_metrics[f'recall_at_{k}'] = hits_at_k / len(ground_truth) if ground_truth else 0
-                    precision_metrics[f'precision_at_{k}'] = hits_at_k / k if k > 0 else 0
-                else:
-                    # 如果 k 大於結果數量，使用全部結果
-                    hits_total = sum(1 for gt in normalized_ground_truth if gt in normalized_retrieved_files)
-                    recall_metrics[f'recall_at_{k}'] = hits_total / len(ground_truth) if ground_truth else 0
-                    precision_metrics[f'precision_at_{k}'] = hits_total / len(results) if results else 0
-            
-            # 舊版相容性
+            # 計算 Recall@K (召回率)
+            hits_by_id = sum(1 for gt in ground_truth if str(gt) in [str(rid) for rid in retrieved_ids])
             hits_by_file = sum(1 for gt in normalized_ground_truth if gt in normalized_retrieved_files)
+            
+            # 計算指標
+            recall_at_k = hits_by_file / len(ground_truth) if ground_truth else 0
+            precision_at_k = hits_by_file / len(results) if results else 0
             
             evaluation.update({
                 'ground_truth': ground_truth,
+                'hits_by_id': hits_by_id,
                 'hits_by_file': hits_by_file,
-                **recall_metrics,  # 展開所有 recall@k 指標
-                **precision_metrics,  # 展開所有 precision@k 指標
+                'recall_at_k': recall_at_k,  # 標準召回率指標
+                'precision_at_k': precision_at_k,  # 標準精確率指標
                 # 保留舊的指標名稱以向後兼容
-                'recall_at_k': recall_metrics.get('recall_at_5', 0),
-                'precision_at_k': precision_metrics.get('precision_at_5', 0),
-                'hit_rate_by_file': recall_metrics.get('recall_at_5', 0)
+                'hit_rate_by_id': hits_by_id / len(ground_truth) if ground_truth else 0,
+                'hit_rate_by_file': recall_at_k
             })
         
         return evaluation
@@ -261,7 +221,7 @@ class BatchEvaluator:
         
         return None
     
-    def evaluate_test_file(self, test_file: str, db_path: str, limit: int = 5, model_name: str = "bge_m3_flag") -> Dict:
+    def evaluate_test_file(self, test_file: str, db_path: str, limit: int = 5) -> Dict:
         """
         評估測試檔案
         
@@ -269,7 +229,6 @@ class BatchEvaluator:
             test_file: 測試檔案路徑
             db_path: 資料庫路徑
             limit: 每個查詢返回的結果數量
-            model_name: embedding 模型名稱
             
         Returns:
             評估結果
@@ -282,13 +241,11 @@ class BatchEvaluator:
         collection_name = generate_collection_name(corpus_name)
         
         # 初始化評估器
-        evaluator = QGpTQueryEvaluator(db_path, collection_name, model_name)
+        evaluator = QGpTQueryEvaluator(db_path, collection_name)
         
         results = []
-        
-        # 初始化累計指標
-        recall_sums = {'recall_at_1': 0, 'recall_at_3': 0, 'recall_at_5': 0, 'recall_at_10': 0}
-        precision_sums = {'precision_at_1': 0, 'precision_at_3': 0, 'precision_at_5': 0, 'precision_at_10': 0}
+        total_recall = 0
+        total_precision = 0
         
         print(f"🔄 評估測試檔案: {Path(test_file).name}")
         print(f"   查詢數量: {len(test_data)}")
@@ -304,110 +261,43 @@ class BatchEvaluator:
                 # 某些測試檔案可能有不同的結構
                 pass
             
-            # 執行評估 (確保搜尋足夠的結果)
-            search_limit = max(limit, 10)  # 至少搜尋 10 個結果以計算 recall@10
-            eval_result = evaluator.evaluate_single_query(query, ground_truth, search_limit)
+            # 執行評估
+            eval_result = evaluator.evaluate_single_query(query, ground_truth, limit)
             results.append(eval_result)
             
-            # 累計所有 recall@k 指標
-            for k in [1, 3, 5, 10]:
-                if f'recall_at_{k}' in eval_result:
-                    recall_sums[f'recall_at_{k}'] += eval_result[f'recall_at_{k}']
-                if f'precision_at_{k}' in eval_result:
-                    precision_sums[f'precision_at_{k}'] += eval_result[f'precision_at_{k}']
+            # 累計指標（使用標準的資訊檢索指標）
+            if 'recall_at_k' in eval_result:
+                total_recall += eval_result['recall_at_k']
+            if 'precision_at_k' in eval_result:
+                total_precision += eval_result['precision_at_k']
             
             # 顯示進度
             if (i + 1) % 10 == 0:
                 print(f"   處理進度: {i + 1}/{len(test_data)}")
         
         # 計算平均指標
-        avg_metrics = {}
-        for k in [1, 3, 5, 10]:
-            avg_metrics[f'avg_recall_at_{k}'] = recall_sums[f'recall_at_{k}'] / len(test_data) if test_data else 0
-            avg_metrics[f'avg_precision_at_{k}'] = precision_sums[f'precision_at_{k}'] / len(test_data) if test_data else 0
+        avg_recall = total_recall / len(test_data) if test_data else 0
+        avg_precision = total_precision / len(test_data) if test_data else 0
         
-        # 準備結果
-        result = {
+        return {
             'test_file': test_file,
             'db_path': db_path,
             'total_queries': len(test_data),
-            **avg_metrics,  # 展開所有平均指標
+            'avg_recall_at_k': avg_recall,      # 標準召回率指標 (Recall@K)
+            'avg_precision_at_k': avg_precision, # 標準精確率指標 (Precision@K)
             # 保留舊的指標名稱以向後兼容
-            'avg_recall_at_k': avg_metrics.get('avg_recall_at_5', 0),
-            'avg_precision_at_k': avg_metrics.get('avg_precision_at_5', 0),
-            'avg_hit_rate': avg_metrics.get('avg_recall_at_5', 0),
-            'avg_precision': avg_metrics.get('avg_precision_at_5', 0),
+            'avg_hit_rate': avg_recall,
+            'avg_precision': avg_precision,
             'detailed_results': results
         }
-        
-        # 儲存實驗結果
-        self._save_experiment_results(db_path, result, model_name)
-        
-        return result
     
-    def _save_experiment_results(self, db_path: str, result: Dict, model_name: str):
-        """
-        儲存實驗結果到 experiment 目錄
-        
-        Args:
-            db_path: 資料庫路徑
-            result: 評估結果
-            model_name: embedding 模型名稱
-        """
-        from pathlib import Path
-        import json
-        
-        # 從資料庫路徑提取名稱
-        db_name = Path(db_path).stem
-        
-        # 準備 metric 資料（只包含統計指標）
-        metric_data = {
-            'db_name': db_name,
-            'test_file': result['test_file'],
-            'total_queries': result['total_queries'],
-            'avg_recall_at_1': result.get('avg_recall_at_1', 0),
-            'avg_recall_at_3': result.get('avg_recall_at_3', 0),
-            'avg_recall_at_5': result.get('avg_recall_at_5', 0),
-            'avg_recall_at_10': result.get('avg_recall_at_10', 0),
-            'avg_precision_at_1': result.get('avg_precision_at_1', 0),
-            'avg_precision_at_3': result.get('avg_precision_at_3', 0),
-            'avg_precision_at_5': result.get('avg_precision_at_5', 0),
-            'avg_precision_at_10': result.get('avg_precision_at_10', 0)
-        }
-        
-        # 準備 detail 資料（包含所有查詢詳情）
-        detail_data = {
-            'db_name': db_name,
-            'test_file': result['test_file'],
-            'total_queries': result['total_queries'],
-            'detailed_results': result['detailed_results']
-        }
-        
-        # 儲存檔案
-        experiment_dir = Path("experiment") / model_name
-        experiment_dir.mkdir(parents=True, exist_ok=True)
-        
-        metric_file = experiment_dir / f"{db_name}_metric.json"
-        detail_file = experiment_dir / f"{db_name}_detail.json"
-        
-        with open(metric_file, 'w', encoding='utf-8') as f:
-            json.dump(metric_data, f, ensure_ascii=False, indent=2)
-        
-        with open(detail_file, 'w', encoding='utf-8') as f:
-            json.dump(detail_data, f, ensure_ascii=False, indent=2)
-        
-        print(f"💾 實驗結果已儲存:")
-        print(f"   📊 Metric: {metric_file}")
-        print(f"   📋 Detail: {detail_file}")
-    
-    def run_batch_evaluation(self, limit: int = 10, save_results: bool = True, model_name: str = "bge_m3_flag") -> Dict:
+    def run_batch_evaluation(self, limit: int = 5, save_results: bool = True) -> Dict:
         """
         執行批次評估
         
         Args:
             limit: 每個查詢返回的結果數量
             save_results: 是否儲存詳細結果
-            model_name: embedding 模型名稱
             
         Returns:
             批次評估結果
@@ -432,14 +322,12 @@ class BatchEvaluator:
             
             try:
                 # 執行評估
-                result = self.evaluate_test_file(test_file, db_path, limit, model_name)
+                result = self.evaluate_test_file(test_file, db_path, limit)
                 batch_results[Path(test_file).stem] = result
                 
                 print(f"✅ 完成評估: {Path(test_file).name}")
-                print(f"   Recall@1: {result.get('avg_recall_at_1', 0):.4f}")
-                print(f"   Recall@3: {result.get('avg_recall_at_3', 0):.4f}")
-                print(f"   Recall@5: {result.get('avg_recall_at_5', 0):.4f}")
-                print(f"   Recall@10: {result.get('avg_recall_at_10', 0):.4f}")
+                print(f"   平均召回率 (Recall@{limit}): {result['avg_recall_at_k']:.4f}")
+                print(f"   平均精確率 (Precision@{limit}): {result['avg_precision_at_k']:.4f}")
                 
             except Exception as e:
                 print(f"❌ 評估失敗: {Path(test_file).name} - {e}")
@@ -481,9 +369,6 @@ def main():
     parser.add_argument('--test-file', help='測試查詢檔案路徑')
     parser.add_argument('--batch-eval', action='store_true', help='批次評估所有測試集')
     parser.add_argument('--limit', type=int, default=5, help='返回結果數量 (預設: 5)')
-    parser.add_argument('--models', default='bge_m3_flag', 
-                       choices=['bge_m3_flag', 'bge_m3_milvus', 'jina_colbert_v2'],
-                       help='Embedding 模型 (預設: bge_m3_flag)')
     parser.add_argument('--format', choices=['detailed', 'simple', 'json'], 
                        default='detailed', help='輸出格式 (預設: detailed)')
     parser.add_argument('--save', action='store_true', help='儲存評估結果到檔案')
@@ -493,19 +378,18 @@ def main():
     # 批次評估
     if args.batch_eval:
         evaluator = BatchEvaluator()
-        results = evaluator.run_batch_evaluation(limit=args.limit, save_results=args.save, model_name=args.models)
+        results = evaluator.run_batch_evaluation(limit=args.limit, save_results=args.save)
         
         # 顯示總結
         if results:
             print(f"\n{'='*60}")
             print("批次評估總結:")
             for test_name, result in results.items():
+                limit = 5  # 預設值，實際值應該從參數中取得
                 print(f"  {test_name}:")
                 print(f"    查詢數量: {result['total_queries']}")
-                print(f"    Recall@1: {result.get('avg_recall_at_1', 0):.4f}")
-                print(f"    Recall@3: {result.get('avg_recall_at_3', 0):.4f}")
-                print(f"    Recall@5: {result.get('avg_recall_at_5', 0):.4f}")
-                print(f"    Recall@10: {result.get('avg_recall_at_10', 0):.4f}")
+                print(f"    平均召回率 (Recall@{limit}): {result['avg_recall_at_k']:.4f}")
+                print(f"    平均精確率 (Precision@{limit}): {result['avg_precision_at_k']:.4f}")
         
         return
     
@@ -522,7 +406,7 @@ def main():
         collection_name = args.collection
     
     # 初始化評估器
-    evaluator = QGpTQueryEvaluator(args.db, collection_name, args.models)
+    evaluator = QGpTQueryEvaluator(args.db, collection_name)
     
     # 測試檔案評估
     if args.test_file:
@@ -531,17 +415,13 @@ def main():
             sys.exit(1)
         
         batch_evaluator = BatchEvaluator()
-        # 確保搜尋足夠的結果以計算 recall@10
-        search_limit = max(args.limit, 10)
-        result = batch_evaluator.evaluate_test_file(args.test_file, args.db, search_limit, args.models)
+        result = batch_evaluator.evaluate_test_file(args.test_file, args.db, args.limit)
         
         print(f"\n評估結果:")
         print(f"測試檔案: {result['test_file']}")
         print(f"查詢總數: {result['total_queries']}")
-        print(f"Recall@1: {result.get('avg_recall_at_1', 0):.4f}")
-        print(f"Recall@3: {result.get('avg_recall_at_3', 0):.4f}")
-        print(f"Recall@5: {result.get('avg_recall_at_5', 0):.4f}")
-        print(f"Recall@10: {result.get('avg_recall_at_10', 0):.4f}")
+        print(f"平均召回率 (Recall@{args.limit}): {result['avg_recall_at_k']:.4f}")
+        print(f"平均精確率 (Precision@{args.limit}): {result['avg_precision_at_k']:.4f}")
         
         if args.save:
             results_file = f"evaluation_{Path(args.test_file).stem}.json"

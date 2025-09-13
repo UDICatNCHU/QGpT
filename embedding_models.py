@@ -3,7 +3,7 @@ Embedding models ABC for QGpT corpus builder.
 All embedding models must inherit from EmbeddingModel.
 """
 from abc import ABC, abstractmethod
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 import numpy as np
 
@@ -59,24 +59,6 @@ class BGE_M3_Flag(EmbeddingModel):
         return {"dense_vecs": result['dense_vecs']}
 
 
-class BGE_M3_Milvus(EmbeddingModel):
-    """BGE-M3 using Milvus hybrid implementation."""
-    
-    def __init__(self, batch_size: int = 64):
-        super().__init__()
-        from pymilvus.model.hybrid import BGEM3EmbeddingFunction
-        import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._model = BGEM3EmbeddingFunction(use_fp16=True, device=device, batch_size=batch_size, max_length=8192)
-        self._dimension = 1024
-        self._name = "bge_m3_milvus"
-        self._batch_size = batch_size
-        
-    def encode(self, texts: list[str]) -> Dict[str, Any]:
-        result = self._model(texts)
-        return {"dense_vecs": result['dense']}
-
-
 def _mean_pool_token_embeddings(token_embeddings):
     """Extract document vector from token-level embeddings via mean pooling."""
     return token_embeddings[0].mean(axis=0)
@@ -113,3 +95,34 @@ class JinaColBERT_V2(EmbeddingModel):
             ]
             embeddings.extend(batch_embeddings)
         return {"dense_vecs": np.array(embeddings)}
+
+
+MODELS = {
+    "bge_m3_flag": BGE_M3_Flag,
+    "jina_colbert_v2": JinaColBERT_V2,
+}
+
+
+def create_embedding_model(model_name: str, **kwargs) -> EmbeddingModel:
+    """Factory function to create embedding model instances.
+    
+    Args:
+        model_name: Name of the model to create
+        **kwargs: Additional arguments to pass to model constructor
+        
+    Returns:
+        EmbeddingModel instance
+        
+    Raises:
+        ValueError: If model_name is not recognized
+    """
+    if model_name not in MODELS:
+        available = ", ".join(MODELS.keys())
+        raise ValueError(f"Unknown model: {model_name}. Available models: {available}")
+    
+    return MODELS[model_name](**kwargs)
+
+
+def get_available_models() -> List[str]:
+    """Get list of available model names."""
+    return list(MODELS.keys())
