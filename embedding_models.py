@@ -55,7 +55,7 @@ class BGE_M3_Flag(EmbeddingModel):
         self._batch_size = batch_size
         
     def encode(self, texts: list[str]) -> Dict[str, Any]:
-        result = self._model.encode(texts, batch_size=self._batch_size)
+        result = self._model.encode(texts, batch_size=self._batch_size, max_length=8192)
         return {"dense_vecs": result['dense_vecs']}
 
 
@@ -74,27 +74,23 @@ class JinaColBERT_V2(EmbeddingModel):
             attend_to_expansion_tokens=True,
             trust_remote_code=True,
             device=device,
+            document_length=8192,  # 就是這個參數
         )
         self._dimension = 128
         self._name = "jina_colbert_v2"
         self._batch_size = batch_size
         
     def encode(self, texts: list[str]) -> Dict[str, Any]:
-        # Process in batches for memory efficiency
-        embeddings = []
-        for i in range(0, len(texts), self._batch_size):
-            batch_texts = texts[i:i + self._batch_size]
-            batch_embeddings = [
-                _mean_pool_token_embeddings(self._model.encode([text], is_query=False))
-                for text in batch_texts
-            ]
-            embeddings.extend(batch_embeddings)
-        return {"dense_vecs": np.array(embeddings)}
-
-
-def _mean_pool_token_embeddings(token_embeddings):
-    """Extract document vector from token-level embeddings via mean pooling."""
-    return token_embeddings[0].mean(axis=0)
+        # 直接用官方 API，它內建批次處理
+        token_embeddings = self._model.encode(
+            texts, 
+            batch_size=self._batch_size,
+            is_query=False,
+            show_progress_bar=False
+        )
+        # 對每個文件的 token embeddings 做 mean pooling
+        pooled_embeddings = [embed.mean(axis=0) for embed in token_embeddings]
+        return {"dense_vecs": np.array(pooled_embeddings)}
 
     
 MODELS = {
