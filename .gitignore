@@ -3,7 +3,10 @@
 db/*/*.db
 db/*/*.db.lock
 *.db
-experiment/*/*.json
+jina/*/*.json
+bge_m3_flag/*/*.json
+experiment/*.json
+
 CLAUDE.md
 qgpt_T1_MTLV_mimo_ch.db
 qgpt_T1_MTLV_mimo_en.db
