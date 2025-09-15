@@ -22,7 +22,6 @@ import sys
 from pathlib import Path
 from typing import List, Dict, Optional
 from pymilvus import MilvusClient
-from FlagEmbedding import BGEM3FlagModel
 
 from utils import (
     load_json_dataset, 
@@ -53,6 +52,7 @@ class CorpusEmbeddingBuilder:
         print(f"🔄 初始化 {model} ...")
         self.model_name = model
         self.embedding_fn = MODELS.get(model)()
+
         print(f"✅ {model} 載入完成")
     
     def scan_directory(self, directory_path: str, pattern: str = "*.json") -> List[str]:
