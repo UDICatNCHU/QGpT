@@ -36,6 +36,18 @@ from embedding_models import EmbeddingModel, MODELS
 # 固定的評估 K 值
 EVAL_K_VALUES = [1, 3, 5, 10]
 
+# qgpt_T5 系列資料庫名稱到 collection name 的對應表
+T5_DB_COLLECTION_MAP = {
+    'qgpt_T5_STR_pT_MiMoT_pT.db': 'emb_T5SingleTRetrievalpTMiMoTpT',
+    'qgpt_T5_STR_pT_FetaQA_pT.db': 'emb_T5SingleTRetrievalpTFetaQApT',
+    'qgpt_T5_STR_pT_OTTQA_pT.db': 'emb_T5SingleTRetrievalpTOTTQApT',
+    'qgpt_T5_STR_pT_E2EWTQ_pT.db': 'emb_T5SingleTRetrievalpTE2EWTQpT',
+    'qgpt_T5_STR_QGpT_MiMoT_QGpT.db': 'emb_T5SingleTRetrievalQGpTMiMoTQGp',
+    'qgpt_T5_STR_QGpT_FetaQA_QGpT.db': 'emb_T5SingleTRetrievalQGpTFetaQAQG',
+    'qgpt_T5_STR_QGpT_OTTQA_QGpT.db': 'emb_T5SingleTRetrievalQGpTOTTQAQGp',
+    'qgpt_T5_STR_QGpT_E2EWTQ_QGpT.db': 'emb_T5SingleTRetrievalQGpTE2EWTQQG'
+}
+
 
 def normalize_filename(filepath: str) -> str:
     """標準化檔案路徑，只保留檔名"""
@@ -44,13 +56,13 @@ def normalize_filename(filepath: str) -> str:
     return str(filepath)
 
 
-def calculate_recall_at_k(retrieved_files: List[str], ground_truth: List[str], 
+def calculate_recall_at_k(retrieved_results: List[Dict], ground_truth: List[str], 
                          k_values: List[int] = EVAL_K_VALUES) -> Dict[str, float]:
     """
     計算多個 K 值的召回率指標
     
     Args:
-        retrieved_files: 檢索到的檔案列表（已排序）
+        retrieved_results: 檢索結果列表，包含 filename 和 sheet_name
         ground_truth: 正確答案檔案列表
         k_values: 要計算的 K 值列表
         
@@ -61,13 +73,22 @@ def calculate_recall_at_k(retrieved_files: List[str], ground_truth: List[str],
         return {f'recall_at_{k}': 0.0 for k in k_values}
     
     normalized_ground_truth = [normalize_filename(gt) for gt in ground_truth]
-    normalized_retrieved = [normalize_filename(rf) for rf in retrieved_files]
     
     recall_metrics = {}
     for k in k_values:
         # 只考慮前 k 個結果
-        top_k_retrieved = normalized_retrieved[:k]
-        hits = sum(1 for gt in normalized_ground_truth if gt in top_k_retrieved)
+        top_k_results = retrieved_results[:k]
+        hits = 0
+        
+        for gt in normalized_ground_truth:
+            # 檢查 filename 或 sheet_name 是否匹配
+            for result in top_k_results:
+                filename = normalize_filename(result.get('filename', ''))
+                sheet_name = normalize_filename(result.get('sheet_name', ''))
+                if gt == filename or gt == sheet_name:
+                    hits += 1
+                    break
+        
         recall_metrics[f'recall_at_{k}'] = hits / len(ground_truth)
     
     return recall_metrics
@@ -99,7 +120,7 @@ class QGpTQueryEvaluator:
             self.client = MilvusClient(self.db_path)
             print("🔄 初始化 BGE-M3 模型...")
             self.embedding_fn = MODELS.get(model)()
-
+            # self.embedding_fn = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True, max_length=8192)
             print("✅ BGE-M3 模型載入完成")
             
             # 檢查集合是否存在
@@ -176,8 +197,7 @@ class QGpTQueryEvaluator:
         
         # 如果有正確答案，計算召回率指標
         if ground_truth:
-            retrieved_files = [r['filename'] for r in results]
-            recall_metrics = calculate_recall_at_k(retrieved_files, ground_truth, EVAL_K_VALUES)
+            recall_metrics = calculate_recall_at_k(results, ground_truth, EVAL_K_VALUES)
             evaluation.update(recall_metrics)
         
         return evaluation
@@ -248,8 +268,12 @@ class BatchEvaluator:
         test_data = load_json_dataset(test_file)
         
         # 根據資料庫路徑生成集合名稱
-        corpus_name = Path(db_path).stem.replace('qgpt_', '')
-        collection_name = generate_collection_name(corpus_name)
+        db_filename = Path(db_path).name
+        if db_filename in T5_DB_COLLECTION_MAP:
+            collection_name = T5_DB_COLLECTION_MAP[db_filename]
+        else:
+            corpus_name = Path(db_path).stem.replace('qgpt_', '')
+            collection_name = generate_collection_name(corpus_name)
         
         # 初始化評估器
         evaluator = QGpTQueryEvaluator(db_path, collection_name, model)
@@ -262,14 +286,12 @@ class BatchEvaluator:
         
         for i, item in enumerate(test_data):
             query = item.get('question', '')
-            
             # 提取正確答案（根據測試檔案結構調整）
             ground_truth = []
             if 'spreadsheet_list' in item:
                 ground_truth = item['spreadsheet_list']
-            elif 'answer' in item:
-                # 某些測試檔案可能有不同的結構
-                pass
+            elif 'Answer_table' in item:
+                ground_truth = [item['Answer_table']]
             
             # 執行評估
             eval_result = evaluator.evaluate_single_query(query, ground_truth)
@@ -427,8 +449,12 @@ def main():
     
     # 自動生成集合名稱
     if not args.collection:
-        corpus_name = Path(args.db).stem.replace('qgpt_', '')
-        collection_name = generate_collection_name(corpus_name)
+        db_filename = Path(args.db).name
+        if db_filename in T5_DB_COLLECTION_MAP:
+            collection_name = T5_DB_COLLECTION_MAP[db_filename]
+        else:
+            corpus_name = Path(args.db).stem.replace('qgpt_', '')
+            collection_name = generate_collection_name(corpus_name)
     else:
         collection_name = args.collection
     
