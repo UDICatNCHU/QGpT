@@ -34,7 +34,7 @@ test_table3:
 	python query_evaluator.py --test-file test_dataset/MiMoTable-English_test.json --db qgpt_T3_mimo_en_TR_pT_and_header.db --model bge_m3_flag 
 	python query_evaluator.py --test-file test_dataset/MiMoTable-English_test.json --db qgpt_T3_mimo_en_TR_pT.db --model bge_m3_flag 
 	python query_evaluator.py --test-file test_dataset/MiMoTable-English_test.json --db qgpt_T3_mimo_en_TR_QG_only.db --model bge_m3_flag 
-	python query_evaluator.py --test-file test_dataset/MiMoTable-English_test.json --db qgpt_T3_mimo_en_TR_QGpT.dbD --model bge_m3_flag 
+	python query_evaluator.py --test-file test_dataset/MiMoTable-English_test.json --db qgpt_T3_mimo_en_TR_QGpT.db --model bge_m3_flag 
 
 test_table5:
 	python query_evaluator.py --test-file test_dataset/MiMoTable-English_test.json --db qgpt_T5_STR_pT_MiMoT_pT.db --model bge_m3_flag 
