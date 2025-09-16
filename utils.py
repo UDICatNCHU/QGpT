@@ -49,34 +49,30 @@ def preprocess_text(text):
 
 def extract_corpus_name_from_path(file_path):
     """
-    從檔案路徑中提取語料庫名稱，用於資料庫命名
-    每個 JSON 檔案對應一個獨立的資料庫
+    Extract corpus name from file path for database naming.
+    Each JSON file corresponds to an independent database.
     
     Args:
-        file_path: 語料庫檔案路徑
+        file_path: Corpus file path
         
     Returns:
-        語料庫名稱（用於資料庫命名）
+        Corpus name for database naming
     """
     path_obj = Path(file_path)
     
-    # 如果是在 Corpora 目錄下
-    if 'Corpora' in path_obj.parts:
-        corpora_index = path_obj.parts.index('Corpora')
-        name_parts = []
-        
-        # 收集 Corpora 後的所有目錄名稱和檔案名稱（不含副檔名）
-        for i in range(corpora_index + 1, len(path_obj.parts)):
-            part = path_obj.parts[i]
-            # 如果是最後一個部分（檔案名），去掉副檔名
-            if i == len(path_obj.parts) - 1:
-                part = Path(part).stem
-            name_parts.append(part)
-        
-        return '_'.join(name_parts)
+    if 'Corpora' not in path_obj.parts:
+        return _normalize_name(path_obj.stem)
     
-    # 如果不在 Corpora 目錄下，使用檔案名（不含副檔名）
-    return path_obj.stem
+    corpora_index = path_obj.parts.index('Corpora')
+    name_parts = list(path_obj.parts[corpora_index + 1:-1])  # 排除檔名
+    name_parts.append(path_obj.stem)  # 加入檔名（無副檔名）
+    return '_'.join(_normalize_name(part) for part in name_parts)
+
+
+def _normalize_name(name):
+    """Normalize path component for database naming."""
+    return (name.replace('&', '_and_')
+               .replace('Full-Table(8k)', 'full_token'))
 
 
 def generate_db_name(corpus_name):
@@ -94,11 +90,11 @@ def generate_db_name(corpus_name):
     
     # 縮短名稱以符合 Milvus 36 字符限制
     # 移除常見的重複詞彙並使用簡寫
-    clean_name = clean_name.replace('Table', 'T')
     clean_name = clean_name.replace('mimo_table_length_variation', 'MTLV')
     clean_name = clean_name.replace('Single_Table_Retrieval', 'STR')
     clean_name = clean_name.replace('Multi_Table_Retrieval', 'MTR')
     clean_name = clean_name.replace('table_representation', 'TR')
+    clean_name = clean_name.replace('Table', 'T')
     
     db_name = f"qgpt_{clean_name}.db"
     
